@@ -19,29 +19,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Dữ liệu trả lời mẫu (nên được lưu trữ bên ngoài nếu cần mở rộng)
-TEMPLATE_REPLIES = {
-    "東京都": "江東区\n江戸川区\n足立区",
-    "江東区": "亀戸6-12-7 第2伸光マンション\n亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)",
-    "江戸川区": "西小岩1丁目30-11",
-}
+
 
 # Xử lý tin nhắn từ người dùng
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý tin nhắn văn bản từ người dùng."""
-    text = update.message.text.lower()
-    reply = TEMPLATE_REPLIES.get(text, "Tôi không hiểu bạn đang nói gì. Vui lòng thử lại.")
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-    logger.info(f"Sent reply: {reply} to chat_id: {update.effective_chat.id}")
+    try:
+        text = update.message.text
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Bạn đã gửi: {text}")
+        logger.info(f"Sent reply: {text} to chat_id: {update.effective_chat.id}")
+    except Exception as e:
+        logger.error(f"Error in handle_message: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Có lỗi xảy ra khi xử lý tin nhắn của bạn.")
+
 
 
 # Xử lý lệnh /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý lệnh /start."""
     await context.bot.send_message(
-        chat_id=update.effective_chat.id, text="Chào mừng đến với 三上はじめに!"
+        chat_id=update.effective_chat.id, text="Chào mừng đến với bot!"
     )
     logger.info(f"Sent start message to chat_id: {update.effective_chat.id}")
+
 
 
 # Endpoint / cho Flask
@@ -60,11 +60,12 @@ def health_check():
         return make_response("Method Not Allowed", 405)  # Trả về 405 cho các phương thức khác
 
 
+
 def run_telegram_bot(token: str, webhook_url: str, port: int):
     """Khởi động bot Telegram."""
     telegram_app = ApplicationBuilder().token(token).build()
     telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    telegram_app.add_handler(MessageHandler(filters.TEXT, handle_message)) # Đơn giản hóa bộ lọc
     # Thêm error handler để log các lỗi không mong muốn.
     telegram_app.add_error_handler(error_handler)
     try:
@@ -74,6 +75,7 @@ def run_telegram_bot(token: str, webhook_url: str, port: int):
         logger.error(f"Error setting up webhook: {e}")
         raise  # Re-raise the exception để Flask biết và có thể log hoặc xử lý nếu cần.
     return telegram_app  # Return ứng dụng để có thể dừng nó một cách rõ ràng.
+
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -91,6 +93,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             )
         except Exception as e:
             logger.warning("Failed to send error message to user", exc_info=e)
+
 
 
 def main():
@@ -141,4 +144,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
