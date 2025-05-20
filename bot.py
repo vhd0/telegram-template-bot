@@ -10,7 +10,7 @@ from telegram.ext import (
 )
 from flask import Flask, request, make_response
 
-# Khởi tạo ứng dụng Flask để phục vụ endpoint /health
+# Khởi tạo ứng dụng Flask để phục vụ endpoint /
 app = Flask(__name__)
 
 # Cấu hình logging
@@ -44,12 +44,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Sent start message to chat_id: {update.effective_chat.id}")
 
 
-# Endpoint /health cho Flask
-@app.route("/", methods=["HEAD"])
+# Endpoint / cho Flask
+@app.route("/", methods=["GET", "HEAD", "POST"])
 def health_check():
-    """Endpoint kiểm tra sức khỏe cho UptimeRobot."""
-    return make_response("", 200)
-
+    """
+    Endpoint kiểm tra sức khỏe cho UptimeRobot và xử lý webhook Telegram.
+    UptimeRobot sử dụng HEAD hoặc GET, Telegram sử dụng POST.
+    """
+    if request.method in ["HEAD", "GET"]:
+        return make_response("", 200)  # Trả về 200 OK cho UptimeRobot
+    elif request.method == "POST":
+        # Xử lý các request POST từ Telegram tại đây.  Hiện tại trả về 200 OK
+        return make_response("", 200)
+    else:
+        return make_response("Method Not Allowed", 405)  # Trả về 405 cho các phương thức khác
 
 
 def run_telegram_bot(token: str, webhook_url: str, port: int):
@@ -103,9 +111,10 @@ def main():
     # Chạy ứng dụng Flask (trong một thread riêng)
     def run_flask_app():
         logger.info(f"Starting Flask app on port {PORT}")
-        app.run(host="0.0.0.0", port=PORT,  )  # Flask chạy trên cùng một cổng với ứng dụng Telegram
+        app.run(host="0.0.0.0", port=PORT)  # Flask chạy trên cùng một cổng với ứng dụng Telegram
 
     import threading
+
     flask_thread = threading.Thread(target=run_flask_app)
     flask_thread.daemon = True  # Flask sẽ tắt khi ứng dụng chính tắt
     flask_thread.start()
@@ -115,6 +124,7 @@ def main():
 
     # Giữ ứng dụng chính chạy để các luồng hoạt động
     import time
+
     try:
         while True:
             time.sleep(1)
@@ -131,3 +141,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
