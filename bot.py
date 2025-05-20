@@ -2,18 +2,18 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TEMPLATE_REPLIES = {
-    "xin chào": "Chào bạn! Tôi có thể giúp gì?",
-    "giúp tôi": "Bạn có thể dùng các lệnh như /start, /help nhé.",
-    "tạm biệt": "Hẹn gặp lại bạn!",
+    "東京都": "江東区\n江戸川区\n足立区",
+    "江東区": "亀戸6-12-7 第2伸光マンション\n亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)",
+    "江戸川区": "西小岩1丁目30-11",
 }
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
-    reply = TEMPLATE_REPLIES.get(text, "Tôi chưa hiểu ý bạn. Hãy thử lại!")
+    reply = TEMPLATE_REPLIES.get(text, "何を言っているのか分かりません。もう一度お試しください。")
     await update.message.reply_text(reply)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Chào mừng bạn đến với bot trả lời theo mẫu!")
+    await update.message.reply_text("三上はじめにへようこそ")
 
 if __name__ == '__main__':
     import os
