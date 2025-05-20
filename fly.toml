@@ -1,0 +1,5 @@
+app = "telegram-template-bot"  # Tên ứng dụng của bạn trên Fly.io
+primary_region = "sin" # Chọn Singapore, nếu bạn muốn gần Việt Nam
+
+[build]
+  dockerfile = "Dockerfile"
