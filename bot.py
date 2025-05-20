@@ -51,6 +51,7 @@ def health_check():
     return make_response("", 200)
 
 
+
 def run_telegram_bot(token: str, webhook_url: str, port: int):
     """Khởi động bot Telegram."""
     telegram_app = ApplicationBuilder().token(token).build()
@@ -89,7 +90,7 @@ def main():
     # Lấy token và URL webhook từ biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443))  # Sử dụng 8443 làm mặc định
+    PORT = int(os.getenv("PORT", 10000))  # Sử dụng 10000
 
     # Kiểm tra xem các biến môi trường đã được thiết lập chưa
     if not TOKEN:
@@ -102,7 +103,7 @@ def main():
     # Chạy ứng dụng Flask (trong một thread riêng)
     def run_flask_app():
         logger.info(f"Starting Flask app on port {PORT}")
-        app.run(host="0.0.0.0", port=PORT)  # Flask chạy trên cùng một cổng với ứng dụng Telegram
+        app.run(host="0.0.0.0", port=PORT,  )  # Flask chạy trên cùng một cổng với ứng dụng Telegram
 
     import threading
     flask_thread = threading.Thread(target=run_flask_app)
@@ -130,4 +131,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
