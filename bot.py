@@ -1,5 +1,6 @@
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import os
 
 TEMPLATE_REPLIES = {
     "東京都": "江東区\n江戸川区\n足立区",
@@ -16,12 +17,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("三上はじめにへようこそ")
 
 if __name__ == '__main__':
-    import os
+    from telegram.ext import Application
+
+    # Lấy token và URL từ biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ví dụ: "https://your-domain.com/your-path"
 
     app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot is running...")
-    app.run_polling()
+    print("Starting webhook...")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 8443)),  # Có thể dùng 443 hoặc 8443 tùy platform
+        webhook_url=WEBHOOK_URL,
+    )
