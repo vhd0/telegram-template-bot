@@ -1,1 +1,3 @@
-python-telegram-bot==20.7
+python-telegram-bot[webhooks]
+aiohttp
+python-dotenv  # Nếu dùng .env để load biến môi trường
