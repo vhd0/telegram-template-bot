@@ -8,7 +8,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, make_response
 
 # Khởi tạo ứng dụng Flask để phục vụ endpoint /health
 app = Flask(__name__)
@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Dữ liệu trả lời mẫu
+# Dữ liệu trả lời mẫu (nên được lưu trữ bên ngoài nếu cần mở rộng)
 TEMPLATE_REPLIES = {
     "東京都": "江東区\n江戸川区\n足立区",
     "江東区": "亀戸6-12-7 第2伸光マンション\n亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)",
@@ -31,9 +31,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý tin nhắn văn bản từ người dùng."""
     text = update.message.text.lower()
     reply = TEMPLATE_REPLIES.get(text, "Tôi không hiểu bạn đang nói gì. Vui lòng thử lại.")
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id, text=reply
-    )  # Sử dụng context.bot
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
     logger.info(f"Sent reply: {reply} to chat_id: {update.effective_chat.id}")
 
 
@@ -42,18 +40,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý lệnh /start."""
     await context.bot.send_message(
         chat_id=update.effective_chat.id, text="Chào mừng đến với 三上はじめに!"
-    )  # Sử dụng context.bot
+    )
     logger.info(f"Sent start message to chat_id: {update.effective_chat.id}")
 
 
 # Endpoint /health cho Flask
-@app.route("/health", methods=["GET", "HEAD"])
+@app.route("/", methods=["HEAD"])
 def health_check():
     """Endpoint kiểm tra sức khỏe cho UptimeRobot."""
-    if request.method == "HEAD":
-        return make_response("", 200)
-    return jsonify({"status": "OK"}), 200
+    return make_response("", 200)
 
+
+def run_telegram_bot(token: str, webhook_url: str, port: int):
+    """Khởi động bot Telegram."""
+    telegram_app = ApplicationBuilder().token(token).build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Thêm error handler để log các lỗi không mong muốn.
+    telegram_app.add_error_handler(error_handler)
+    try:
+        logger.info(f"Setting webhook to {webhook_url}")
+        telegram_app.run_webhook(listen="0.0.0.0", port=port, webhook_url=webhook_url)
+    except Exception as e:
+        logger.error(f"Error setting up webhook: {e}")
+        raise  # Re-raise the exception để Flask biết và có thể log hoặc xử lý nếu cần.
+    return telegram_app  # Return ứng dụng để có thể dừng nó một cách rõ ràng.
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -64,10 +75,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Try to send an alert to the user!
     if update and update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Rất tiếc, đã có lỗi xảy ra. Vui lòng thử lại sau.",
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Rất tiếc, đã có lỗi xảy ra. Vui lòng thử lại sau.",
+            )
+        except Exception as e:
+            logger.warning("Failed to send error message to user", exc_info=e)
 
 
 def main():
@@ -85,43 +99,30 @@ def main():
         logger.critical("WEBHOOK_URL environment variable is missing.")
         return
 
-    # Xây dựng ứng dụng Telegram
-    telegram_app = ApplicationBuilder().token(TOKEN).build()
-
-    # Thêm các handler
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    telegram_app.add_error_handler(error_handler)
-
-    # Thiết lập webhook
-    try:
-        logger.info(f"Setting webhook to {WEBHOOK_URL}")
-        telegram_app.run_webhook(listen="0.0.0.0", port=PORT, webhook_url=WEBHOOK_URL)
-    except Exception as e:
-        logger.error(f"Error setting up webhook: {e}")
-        return
-
     # Chạy ứng dụng Flask (trong một thread riêng)
     def run_flask_app():
-        logger.info(f"Starting Flask app on port {5000}")
-        app.run(host="0.0.0.0", port=5000)  # Flask chạy trên cổng 5000
+        logger.info(f"Starting Flask app on port {PORT}")
+        app.run(host="0.0.0.0", port=PORT)  # Flask chạy trên cùng một cổng với ứng dụng Telegram
 
-    import threading  # Import threading ở đây để tránh lỗi
-
+    import threading
     flask_thread = threading.Thread(target=run_flask_app)
     flask_thread.daemon = True  # Flask sẽ tắt khi ứng dụng chính tắt
     flask_thread.start()
 
+    # Khởi động bot Telegram
+    telegram_app = run_telegram_bot(TOKEN, WEBHOOK_URL, PORT)
+
     # Giữ ứng dụng chính chạy để các luồng hoạt động
-    import time  # Import time ở đây
+    import time
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Stopping bot and Flask app...")
-        # Gracefully stop the telegram app
+        # Dừng bot Telegram một cách rõ ràng
         telegram_app.stop()
-        # No need to stop flask app, it will exit when the main thread exits.
+        telegram_app.shutdown()  # Shutdown app
+        # Không cần dừng явно Flask app, nó sẽ thoát khi luồng chính thoát.
     except Exception as e:
         logger.error(f"An error occurred: {e}")
 
