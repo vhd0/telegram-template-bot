@@ -3,6 +3,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 import os
 from flask import Flask, request, jsonify
 import asyncio
+from hypercorn.asyncio import serve
+from hypercorn.config import Config
 
 # Khởi tạo Flask app
 flask_app = Flask(__name__)
@@ -39,11 +41,11 @@ async def main():
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-    # Khởi tạo Telegram Application
-    application = ApplicationBuilder().token(TOKEN).build()
+    # Khởi tạo Telegram Application và liên kết rõ ràng với vòng lặp sự kiện hiện tại
+    # Điều này giúp đảm bảo Application sử dụng đúng vòng lặp sự kiện của Hypercorn
+    application = ApplicationBuilder().token(TOKEN).loop(asyncio.get_running_loop()).build()
 
     # KHỞI TẠO ỨNG DỤNG TRƯỚC KHI XỬ LÝ CẬP NHẬT
-    # Đây là bước quan trọng để khắc phục lỗi "Application was not initialized"
     await application.initialize()
 
     application.add_handler(CommandHandler("start", start))
@@ -72,11 +74,6 @@ async def main():
 
     # Chạy Flask app để lắng nghe các yêu cầu HTTP (bao gồm /health và webhook)
     print(f"Flask app listening on port {PORT}")
-    # Sử dụng await để chạy Flask app trong ngữ cảnh async
-    # Flask sẽ tự quản lý vòng lặp sự kiện của nó
-    # Lưu ý: Flask cần được cài đặt với extra 'async' (Flask[async])
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     await serve(flask_app, config)
