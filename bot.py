@@ -3,17 +3,9 @@ import os
 import asyncio
 import pandas as pd 
 
-# Firebase Imports (ĐÃ ĐƯỢC LOẠI BỎ)
-# from firebase_admin import credentials, initialize_app, firestore, auth
-# from firebase_admin.exceptions import FirebaseError
-# import json 
-# import jwt 
-
-# Telegram Imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
-# Flask Imports (for health check)
 from flask import Flask, request, jsonify 
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
@@ -24,14 +16,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global Firebase and Firestore variables (ĐÃ ĐƯỢC LOẠI BỎ)
-# db = None
-# firebase_auth = None
-# current_user_id = None 
-# __app_id = None 
-# firebase_config_str = None 
-# initial_auth_token = None 
-
 flask_app = Flask(__name__)
 application = None 
 
@@ -41,6 +25,20 @@ WEBHOOK_PATH = "/webhook_telegram"
 # Đường dẫn đến file Excel
 EXCEL_FILE_PATH = "rep.xlsx"
 DATA_TABLE = [] # Khởi tạo rỗng, sẽ được điền từ Excel
+
+# Global mappings for shortening callback_data
+STRING_TO_ID_MAP = {} # Maps full string to a short integer ID
+ID_TO_STRING_MAP = {} # Maps short integer ID back to full string
+next_id = 0
+
+def get_or_create_id(text: str) -> int:
+    """Assigns a unique short integer ID to a given string."""
+    global next_id
+    if text not in STRING_TO_ID_MAP:
+        STRING_TO_ID_MAP[text] = next_id
+        ID_TO_STRING_MAP[next_id] = text
+        next_id += 1
+    return STRING_TO_ID_MAP[text]
 
 # --- Tải dữ liệu từ Excel ---
 try:
@@ -54,6 +52,13 @@ try:
     # Đảm bảo tất cả các giá trị được chuyển thành chuỗi để tránh lỗi so khớp
     DATA_TABLE = df.astype(str).to_dict(orient='records')
     logger.info(f"Successfully loaded data from {EXCEL_FILE_PATH}")
+
+    # Populate the ID mappings for all relevant strings in DATA_TABLE
+    for row in DATA_TABLE:
+        get_or_create_id(row["Key"])
+        get_or_create_id(row["Rep1"])
+        get_or_create_id(row["Rep2"])
+    logger.info("String to ID mappings created successfully.")
 
 except FileNotFoundError:
     logger.critical(f"Error: {EXCEL_FILE_PATH} not found. Please ensure it's in the root directory.")
@@ -75,49 +80,22 @@ LEVEL_REP3 = "rep3" # Cấp độ này chỉ ra đây là phản hồi văn bả
 # Set để lưu trữ user_id đã được chào mừng (sẽ bị reset khi bot khởi động lại)
 welcomed_users = set()
 
-# --- Firestore Functions (ĐÃ ĐƯỢC LOẠI BỎ) ---
-# async def is_user_welcomed_firestore(user_telegram_id: int) -> bool:
-#     """Checks if a user has been welcomed using Firestore."""
-#     if db is None or current_user_id is None:
-#         logger.error("Firestore DB or current_user_id not initialized.")
-#         return False 
-
-#     try:
-#         doc_ref = db.collection(f"artifacts/{__app_id}/users/{current_user_id}/welcomed_users_status").document(str(user_telegram_id))
-#         doc = await asyncio.to_thread(doc_ref.get) 
-#         return doc.exists and doc.get('welcomed') == True
-#     except FirebaseError as e:
-#         logger.error(f"Firestore error checking welcome status for {user_telegram_id}: {e}")
-#         return False
-#     except Exception as e:
-#         logger.error(f"Unexpected error checking welcome status for {user_telegram_id}: {e}")
-#         return False
-
-# async def mark_user_welcomed_firestore(user_telegram_id: int):
-#     """Marks a user as welcomed in Firestore."""
-#     if db is None or current_user_id is None:
-#         logger.error("Firestore DB or current_user_id not initialized.")
-#         return
-
-#     try:
-#         doc_ref = db.collection(f"artifacts/{__app_id}/users/{current_user_id}/welcomed_users_status").document(str(user_telegram_id))
-#         await asyncio.to_thread(doc_ref.set({'welcomed': True})) 
-#         logger.info(f"User {user_telegram_id} marked as welcomed in Firestore.")
-#     except FirebaseError as e:
-#         logger.error(f"Firestore error marking welcome status for {user_telegram_id}: {e}")
-#     except Exception as e:
-#         logger.error(f"Unexpected error marking welcome status for {user_telegram_id}: {e}")
-
 # --- Hàm gửi các nút cấp độ đầu tiên ---
 async def send_initial_key_buttons(update_object: Update):
     """Gửi tin nhắn chào mừng và các nút cấp độ 'Key' ban đầu."""
-    initial_keys = set()
+    initial_keys_display = set() # For display text
+    initial_keys_id = set()      # For callback_data IDs
+
     for row in DATA_TABLE:
-        initial_keys.add(row["Key"])
+        initial_keys_display.add(row["Key"])
+        initial_keys_id.add(get_or_create_id(row["Key"])) # Store ID
 
     keyboard = []
-    for key_val in sorted(list(initial_keys)):
-        keyboard.append([InlineKeyboardButton(key_val, callback_data=f"{LEVEL_KEY}:{key_val}::")])
+    # Sort by display text for consistent order
+    for key_val_display in sorted(list(initial_keys_display)):
+        key_val_id = get_or_create_id(key_val_display) # Get ID for callback_data
+        # Display full text, but use ID in callback_data
+        keyboard.append([InlineKeyboardButton(key_val_display, callback_data=f"{LEVEL_KEY}:{key_val_id}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     user_telegram_id = update_object.message.from_user.id
@@ -165,76 +143,89 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await query.answer() 
 
+    # Phân tích callback_data: level:key_id:rep1_id:rep2_id
     data_parts = query.data.split(':')
     current_level = data_parts[0]
-    selected_key = data_parts[1]
-    selected_rep1 = data_parts[2] if len(data_parts) > 2 else ''
-    selected_rep2 = data_parts[3] if len(data_parts) > 3 else ''
+    selected_key_id = int(data_parts[1]) # Parse ID
+    selected_rep1_id = int(data_parts[2]) if data_parts[2] else '' # Parse ID
+    selected_rep2_id = int(data_parts[3]) if data_parts[3] else '' # Parse ID
 
-    logger.info(f"Button press: Level={current_level}, Key={selected_key}, Rep1={selected_rep1}, Rep2={selected_rep2}")
+    # Convert IDs back to original strings for logic and display
+    selected_key_display = ID_TO_STRING_MAP.get(selected_key_id, str(selected_key_id))
+    selected_rep1_display = ID_TO_STRING_MAP.get(selected_rep1_id, str(selected_rep1_id)) if selected_rep1_id != '' else ''
+    selected_rep2_display = ID_TO_STRING_MAP.get(selected_rep2_id, str(selected_rep2_id)) if selected_rep2_id != '' else ''
+
+    logger.info(f"Button press: Level={current_level}, Key_ID={selected_key_id} ({selected_key_display}), Rep1_ID={selected_rep1_id} ({selected_rep1_display}), Rep2_ID={selected_rep2_id} ({selected_rep2_display})")
 
     if current_level == LEVEL_KEY:
-        next_rep1_values = set()
+        next_rep1_values_display = set()
         for row in DATA_TABLE:
-            if row["Key"] == selected_key:
-                next_rep1_values.add(row["Rep1"])
+            # So sánh với ID của Key đã chọn
+            if get_or_create_id(row["Key"]) == selected_key_id:
+                next_rep1_values_display.add(row["Rep1"])
         
-        if next_rep1_values:
+        if next_rep1_values_display:
             keyboard = []
-            for rep1_val in sorted(list(next_rep1_values)):
-                keyboard.append([InlineKeyboardButton(rep1_val, callback_data=f"{LEVEL_REP1}:{selected_key}:{rep1_val}:")])
+            for rep1_val_display in sorted(list(next_rep1_values_display)):
+                rep1_val_id = get_or_create_id(rep1_val_display)
+                # Display full text, use ID in callback_data
+                keyboard.append([InlineKeyboardButton(rep1_val_display, callback_data=f"{LEVEL_REP1}:{selected_key_id}:{rep1_val_id}:")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
+                await query.edit_message_text(text=f"選択されました: {selected_key_display}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
+                await query.message.reply_text(f"選択されました: {selected_key_display}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_key}\n情報が見つかりません。")
+                await query.edit_message_text(text=f"選択されました: {selected_key_display}\n情報が見つかりません。")
             except Exception as e:
                 logger.warning("Could not edit message for REP1 (no info): %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key}\n情報が見つかりません。")
+                await query.message.reply_text(f"選択されました: {selected_key_display}\n情報が見つかりません。")
 
     elif current_level == LEVEL_REP1:
-        next_rep2_values = set()
+        next_rep2_values_display = set()
         for row in DATA_TABLE:
-            if row["Key"] == selected_key and row["Rep1"] == selected_rep1:
-                next_rep2_values.add(row["Rep2"])
+            # So sánh với ID của Key và Rep1 đã chọn
+            if get_or_create_id(row["Key"]) == selected_key_id and get_or_create_id(row["Rep1"]) == selected_rep1_id:
+                next_rep2_values_display.add(row["Rep2"])
 
-        if next_rep2_values:
+        if next_rep2_values_display:
             keyboard = []
-            for rep2_val in sorted(list(next_rep2_values)):
-                keyboard.append([InlineKeyboardButton(rep2_val, callback_data=f"{LEVEL_REP2}:{selected_key}:{selected_rep1}:{rep2_val}")])
+            for rep2_val_display in sorted(list(next_rep2_values_display)):
+                rep2_val_id = get_or_create_id(rep2_val_display)
+                # Display full text, use ID in callback_data
+                keyboard.append([InlineKeyboardButton(rep2_val_display, callback_data=f"{LEVEL_REP2}:{selected_key_id}:{selected_rep1_id}:{rep2_val_id}")])
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_rep1}\n次に進んでください:", reply_markup=reply_markup)
+                await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP2: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
+                await query.message.reply_text(f"選択されました: {selected_rep1_display}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_rep1}\n情報が見つかりません。")
+                await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n情報が見つかりません。")
             except Exception as e:
                 logger.warning("Could not edit message for REP2 (no info): %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1}\n情報が見つかりません。")
+                await query.message.reply_text(f"選択されました: {selected_rep1_display}\n情報が見つかりません。")
 
     elif current_level == LEVEL_REP2:
         final_text = "情報が見つかりません。"
         for row in DATA_TABLE: 
-            if row["Key"] == selected_key and \
-               row["Rep1"] == selected_rep1 and \
-               row["Rep2"] == selected_rep2:
+            # So sánh với ID của Key, Rep1, Rep2 đã chọn
+            if get_or_create_id(row["Key"]) == selected_key_id and \
+               get_or_create_id(row["Rep1"]) == selected_rep1_id and \
+               get_or_create_id(row["Rep2"]) == selected_rep2_id:
                 final_text = row["Rep3"]
                 break
         
         try:
-            await query.edit_message_text(text=f"選択されました: {selected_rep2}\n詳細情報:\n{final_text}\nありがとうございました。")
+            await query.edit_message_text(text=f"選択されました: {selected_rep2_display}\n詳細情報:\n{final_text}\nありがとうございました。")
         except Exception as e:
             logger.warning("Could not edit message (final): %s - %s", query.message.message_id, e)
-            await query.message.reply_text(f"選択されました: {selected_rep2}\n詳細情報:\n{final_text}\nありがとうございました。")
+            await query.message.reply_text(f"選択されました: {selected_rep2_display}\n詳細情報:\n{final_text}\nありがとうございました。")
 
     else:
         try:
@@ -291,7 +282,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def run_full_application():
     global application
 
-    # Lấy các biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     PORT = int(os.getenv("PORT", 8443)) 
@@ -305,41 +295,31 @@ async def run_full_application():
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-    # Build the Application của python-telegram-bot
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Thêm handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
     application.add_error_handler(error_handler)
 
-    # Khởi tạo Application của python-telegram-bot
     await application.initialize() 
 
-    # Thiết lập Telegram webhook
     logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
     try:
         await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
         logger.info("Telegram webhook set successfully.")
     except Exception as e:
         logger.error("Error setting Telegram webhook: %s", e)
-        # Nếu webhook không thiết lập được, có thể bot sẽ không hoạt động
-        # Bạn có thể chọn raise lỗi ở đây nếu muốn dừng triển khai
-        # raise
 
-    # Chạy Hypercorn để phục vụ Flask app (bao gồm cả webhook Telegram và health check)
     logger.info("Flask app (via Hypercorn) listening on port %d", PORT)
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     
-    # serve là một coroutine và sẽ chạy vô thời hạn, giữ event loop mở
     await serve(flask_app, config)
 
 
 if __name__ == '__main__':
     try:
-        # Chạy hàm async chính
         asyncio.run(run_full_application())
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
