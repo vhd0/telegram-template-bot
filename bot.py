@@ -1,13 +1,9 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
-from flask import Flask, request, jsonify # Giữ Flask và request
+from flask import Flask, request, jsonify 
 import asyncio
-# Loại bỏ hypercorn imports vì telegram-bot sẽ quản lý server webhook nội bộ
-# from hypercorn.asyncio import serve
-# from hypercorn.config import Config
-import logging
-import pandas as pd
+import pandas as pd 
 
 # --- Configuration ---
 logging.basicConfig(
@@ -72,9 +68,9 @@ async def send_initial_key_buttons(update_or_message_object):
 
     if isinstance(update_or_message_object, Update):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+        await update_or_message_object.message.reply_text("以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
     else:
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+        await update_or_message_object.message.reply_text("以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
 
 
 # --- Telegram Bot Handlers ---
@@ -134,7 +130,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n情報が見つかりません。")
@@ -158,7 +154,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP2: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n情報が見つかりません。")
@@ -199,7 +195,7 @@ def health_check():
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 async def telegram_webhook():
     """Xử lý các cập nhật Telegram đến qua webhook."""
-    global application
+    global application 
     if application is None:
         logger.error("Telegram Application object not initialized yet.")
         return "Internal Server Error: Bot not ready", 500
@@ -222,56 +218,50 @@ async def telegram_webhook():
 
 
 # --- Main Application Logic ---
-async def main():
-    """Hàm chính để khởi tạo và chạy bot Telegram và server Flask."""
-    global application
+# Loại bỏ async def main() và asyncio.run(main())
+# Thay vào đó, chạy trực tiếp application.run_webhook()
+if __name__ == '__main__':
+    # Khởi tạo application ở đây
+    application = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
 
-    TOKEN = os.getenv("BOT_TOKEN")
-    BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443))
-
-    if not TOKEN:
-        logger.error("BOT_TOKEN environment variable not set.")
-        raise ValueError("BOT_TOKEN environment variable not set.")
-    if not BASE_WEBHOOK_URL:
-        logger.error("WEBHOOK_URL environment variable not set.")
-        raise ValueError("WEBHOOK_URL environment variable not set.")
-
-    FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
-
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    await application.initialize()
-
+    # Thêm các handler
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
 
-    # --- Set Telegram Webhook ---
-    logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
-    try:
-        await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
-        logger.info("Telegram webhook set successfully.")
-    except Exception as e:
-        logger.error("Error setting Telegram webhook: %s", e)
+    # Lấy các biến môi trường
+    TOKEN = os.getenv("BOT_TOKEN")
+    BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    PORT = int(os.getenv("PORT", 8443)) # Render thường dùng 10000, nhưng 8443 cũng phổ biến
 
-    # --- Run Application with Webhook Server ---
-    # Đây là cách chính xác để chạy Telegram bot trong chế độ webhook với Flask.
-    # Nó sẽ quản lý event loop và server một cách nội bộ.
+    if not TOKEN:
+        logger.critical("BOT_TOKEN environment variable not set. Exiting.")
+        raise ValueError("BOT_TOKEN environment variable not set.")
+    if not BASE_WEBHOOK_URL:
+        logger.critical("WEBHOOK_URL environment variable not set. Exiting.")
+        raise ValueError("WEBHOOK_URL environment variable not set.")
+
+    FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
+
+    # Thiết lập Webhook Telegram (có thể cần await)
+    # Tuy nhiên, run_webhook() sẽ tự động gọi set_webhook()
+    # Nên chúng ta có thể bỏ qua việc gọi set_webhook() ở đây để tránh trùng lặp
+    # và để run_webhook() quản lý hoàn toàn.
+    # logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
+    # try:
+    #     asyncio.run(application.bot.set_webhook(url=FULL_WEBHOOK_URL))
+    #     logger.info("Telegram webhook set successfully.")
+    # except Exception as e:
+    #     logger.error("Error setting Telegram webhook: %s", e)
+
+    # Chạy Telegram Bot Application trong chế độ webhook
     logger.info("Starting Telegram Bot Application in webhook mode.")
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=FULL_WEBHOOK_URL
-    )
-
-# --- Entry Point ---
-if __name__ == '__main__':
     try:
-        # asyncio.run() sẽ tạo và quản lý event loop.
-        # application.run_webhook() sẽ chạy trên event loop đó.
-        # Không cần Hypercorn.
-        asyncio.run(main())
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=FULL_WEBHOOK_URL
+        )
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
