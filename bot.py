@@ -1,20 +1,17 @@
-import os
-import asyncio
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
-from aiohttp import web
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+from flask import Flask, request, jsonify # Thêm Flask
 
-# ========== Template Replies ==========
+# Khởi tạo Flask app
+flask_app = Flask(__name__)
+
 TEMPLATE_REPLIES = {
     "東京都": "江東区\n江戸川区\n足立区",
     "江東区": "亀戸6-12-7 第2伸光マンション\n亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)",
     "江戸川区": "西小岩1丁目30-11",
 }
 
-# ========== Handlers ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
     reply = TEMPLATE_REPLIES.get(text, "何を言っているのか分かりません。もう一度お試しください。")
@@ -23,42 +20,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("三上はじめにへようこそ")
 
-# ========== Healthcheck Endpoint ==========
-async def healthcheck(request):
-    return web.Response(text="OK", status=200)
+# Endpoint /health cho Render kiểm tra tình trạng ứng dụng
+@flask_app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"})
 
-# ========== Main Entrypoint ==========
-async def main():
+if __name__ == '__main__':
     TOKEN = os.getenv("BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     PORT = int(os.getenv("PORT", 8443))
 
-    # 1. Tạo Telegram bot application
+    # Khởi tạo Telegram Application
     application = ApplicationBuilder().token(TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 2. Tạo aiohttp server cho health check
-    aio_app = web.Application()
-    aio_app.router.add_get("/health", healthcheck)
+    print("Setting up webhook for Telegram bot...")
+    
+    # Hàm xử lý webhook của Telegram thông qua Flask
+    @flask_app.route(f"/{WEBHOOK_URL.split('/')[-1]}", methods=["POST"])
+    async def telegram_webhook():
+        if request.method == "POST":
+            # Xử lý update từ Telegram
+            update = Update.de_json(request.get_json(force=True), application.bot)
+            await application.process_update(update)
+        return "ok"
 
-    # 3. Chạy aiohttp site cho /health
-    runner = web.AppRunner(aio_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    # Đặt webhook cho Telegram bot
+    # Đây là bước quan trọng để Telegram biết gửi update về đâu
+    print(f"Setting Telegram webhook to: {WEBHOOK_URL}")
+    application.run_once(application.bot.set_webhook(url=WEBHOOK_URL))
 
-    print(f"✅ /health is running on port {PORT}")
-    print("🚀 Starting Telegram bot webhook...")
-
-    # 4. Khởi động bot webhook
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(WEBHOOK_URL)
-
-    # 5. Giữ chương trình chạy (đợi các tín hiệu shutdown)
-    await application.updater.start_polling()  # Hoặc: await application.updater.start_webhook() nếu cần
-    await application.wait_until_shutdown()
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    # Chạy Flask app để lắng nghe các yêu cầu HTTP (bao gồm /health và webhook)
+    print(f"Flask app listening on port {PORT}")
+    flask_app.run(host="0.0.0.0", port=PORT)
