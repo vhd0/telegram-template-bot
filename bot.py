@@ -6,7 +6,7 @@ import asyncio
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 import logging
-from pykakasi import kakasi # Import pykakasi
+from pykakasi import kakasi
 
 # --- Configuration ---
 logging.basicConfig(
@@ -15,6 +15,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 flask_app = Flask(__name__)
+# Khai báo 'application' là biến global, sẽ được khởi tạo trong main()
+application = None 
 
 WEBHOOK_PATH = "/webhook_telegram"
 
@@ -27,27 +29,42 @@ converter = kks.getConverter()
 
 # --- Bot Reply Data ---
 # All keys in TEMPLATE_REPLIES should be in Katakana for consistent lookup
-# (or the format you choose to convert user input to).
-# For simplicity, we'll convert user input to Katakana and match these Katakana keys.
 TEMPLATE_REPLIES = {
-    "トウキョウト": ["江東区", "江戸川区", "足立区"],
-    "コウトウク": ["亀戸6-12-7 第2伸光マンション", "亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)"],
-    "エドガワク": ["西小岩1丁目30-11"],
-    "アダルク": ["〇〇区", "△△区"], # Example: "足立区" in Katakana
+    "トウキョウト": ["江東区", "江戸川区", "足立区"], # 東京都
+    "コウトウク": ["亀戸6-12-7 第2伸光マンション", "亀戸6丁目47-2 ウィンベル亀戸(MONTHLY亀戸1)"], # 江東区
+    "エドガワク": ["西小岩1丁目30-11"], # 江戸川区
+    "アダチク": ["〇〇区", "△△区"], # Example: "足立区" in Katakana
 }
+
+# Set để lưu trữ user_id đã được chào mừng.
+# Lưu ý: Sẽ bị reset khi bot khởi động lại.
+# Đối với ứng dụng thực tế, bạn sẽ dùng database.
+welcomed_users = set()
 
 # --- Utility Function to Normalize Japanese Input ---
 def normalize_japanese_input(text: str) -> str:
     """Converts Japanese text to Katakana for consistent matching."""
     return converter.do(text)
 
-
 # --- Telegram Bot Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Responds to user messages based on TEMPLATE_REPLIES with inline buttons."""
+    user_id = update.message.from_user.id
+
+    # Check if user has been welcomed
+    if user_id not in welcomed_users:
+        await update.message.reply_text("三上はじめにへようこそ") # Japanese welcome message
+        # Tạo nút "東京都"
+        keyboard = [[InlineKeyboardButton("東京都", callback_data="東京都")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+        welcomed_users.add(user_id) # Add user to welcomed set
+        return # Stop processing this message as it's a welcome
+    
+    # If user is already welcomed, process their input normally
     if update.message and update.message.text:
         user_input_raw = update.message.text
-        user_input_normalized = normalize_japanese_input(user_input_raw) # Normalize input to Katakana
+        user_input_normalized = normalize_japanese_input(user_input_raw) 
         
         logger.info(f"Received text: '{user_input_raw}', Normalized: '{user_input_normalized}'")
 
@@ -64,10 +81,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command (optional, can be kept for testing)."""
-    # This handler might not be strictly necessary if you send the initial message programmatically.
-    # But it's good to keep it for testing.
-    await update.message.reply_text("三上はじめにへようこそ")
+    """Handles the /start command - can just trigger the welcome logic."""
+    user_id = update.message.from_user.id
+    if user_id not in welcomed_users: # To prevent double welcome if /start is sent after welcome
+        await update.message.reply_text("三上はじめにへようこそ")
+        keyboard = [[InlineKeyboardButton("東京都", callback_data="東京都")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+        welcomed_users.add(user_id)
+    else:
+        await update.message.reply_text("すでにようこそ！") # Already welcomed message
 
 
 # --- New handler for Callback Queries ---
@@ -108,10 +131,38 @@ def health_check():
     """Endpoint for Render's health checks."""
     return jsonify({"status": "ok"})
 
+# ĐỊNH NGHĨA ROUTE WEBHOOK BÊN NGOÀI HÀM main()
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+async def telegram_webhook():
+    """Handles incoming Telegram updates via webhook."""
+    global application # Truy cập biến global 'application'
+    if application is None:
+        logger.error("Telegram Application object not initialized yet.")
+        # Trả về lỗi 500 nếu application chưa sẵn sàng, nhưng Telegram vẫn sẽ thử lại
+        return "Internal Server Error: Bot not ready", 500
+
+    if request.method == "POST":
+        try:
+            json_data = request.get_json(force=True)
+            if not json_data:
+                logger.warning("Received empty or invalid JSON payload from webhook.")
+                return "Bad Request", 400
+
+            update = Update.de_json(json_data, application.bot)
+            await application.process_update(update)
+            logger.info("Successfully processed Telegram update.") # Thêm log thành công
+            return "ok", 200 # Luôn trả về 200 OK để Telegram không thử lại liên tục
+        except Exception as e:
+            logger.error("Error processing Telegram update: %s", e)
+            return "ok", 200 # Trả về 200 OK ngay cả khi có lỗi nội bộ
+    return "Method Not Allowed", 405 # For non-POST requests
+
 
 # --- Main Application Logic ---
 async def main():
     """Main function to initialize and run the Telegram bot and Flask server."""
+    global application # Gán giá trị cho biến global 'application'
+
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     PORT = int(os.getenv("PORT", 8443))
@@ -130,115 +181,17 @@ async def main():
     await application.initialize()
 
     # Add handlers
-    application.add_handler(CommandHandler("start", start)) # Keep for manual testing if needed
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
-
 
     # --- Set Telegram Webhook ---
     logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
     try:
         await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
         logger.info("Telegram webhook set successfully.")
-        
-        # --- Send initial welcome message and button after webhook is set ---
-        # Get bot's own info
-        bot_info = await application.bot.get_me()
-        logger.info(f"Bot info: {bot_info.username} (ID: {bot_info.id})")
-
-        # This part requires a chat_id to send the message.
-        # For a webhook setup, you generally don't have a specific chat_id upfront
-        # unless it's the first interaction.
-        # The best way to achieve this is when the webhook receives its first update.
-        # Alternatively, if you know a specific chat_id (e.g., admin chat), you can use it here.
-        # For a general "first message" on bot startup, Telegram doesn't provide a direct way
-        # to send a message to all users who might interact.
-        # A common approach for this is to send it on the very first incoming message (e.g., /start)
-        # or have the user initiate contact.
-        #
-        # For *this specific request* (send without /start), the most robust way
-        # is to send it as a greeting *when the webhook is hit for the first time by a new user's message*.
-        # However, to meet the literal "send on startup" without a /start from the user,
-        # we can't directly target a user here.
-        #
-        # Let's reconsider. The user's prompt implies "when the bot starts, the user sees this".
-        # A Telegram bot primarily reacts to user input. The bot itself doesn't "start" a conversation
-        # with an arbitrary user without some trigger (like /start, or them sending any message).
-        #
-        # Option 1 (Recommended for Webhooks): Let the user initiate contact.
-        # The `/start` command handler is the natural place for this initial greeting.
-        #
-        # Option 2 (If you *must* push this message without /start):
-        # This is complex for webhooks as you need to know *who* to send it to.
-        # You'd need a persistent storage of user IDs that have interacted with your bot before,
-        # and then iterate through them and send. This is outside the scope of "simple startup message".
-        #
-        # Given the phrasing "không cần nhập '/start'", the most practical interpretation
-        # is that the bot *responds* with this initial message the first time it processes *any* update from a user.
-        # The `/start` command is the standard way to trigger this for new users.
-        #
-        # If the goal is that *any* first message from a user (not just /start) triggers the welcome,
-        # you'd need to modify `handle_message` to check if a user is "new" or hasn't received the welcome.
-        #
-        # For now, I will assume the *spirit* of "không cần nhập '/start'" means
-        # the default welcome is associated with a `/start` command, which is typical.
-        #
-        # If you truly want to push a message without any user input, it's a broadcast scenario,
-        # and usually requires managing `chat_id`s.
-        #
-        # Let's keep the `/start` handler as the entry point for the welcome message for simplicity and best practice.
-        # The initial message will be sent when the bot receives its first update (e.g., when the user types anything or /start).
-        # To strictly meet "đưa ra nút '東京都' mà không cần nhập '/start'", it implies
-        # *every* user, *after* the bot deploys, should get this. This is not how webhooks typically work.
-        # A bot responds to user actions.
-        #
-        # Re-evaluating based on the likely user intent:
-        # The user wants "三上はじめにへようこそ" + "東京都" button as the very *first* interaction.
-        # This is handled by the `/start` command. If a user sends *any other message first*,
-        # it will fall to `handle_message` and get "何を言っているのか分かりません。".
-        #
-        # If you truly mean:
-        # 1. User opens chat -> Bot sends welcome + button (requires direct `bot.send_message` with known chat_id, tricky with webhooks for first contact).
-        # 2. User sends ANY text -> Bot sends welcome + button IF it's first time.
-        #
-        # For now, sticking to the standard `/start` approach, as it's the most reliable for webhooks.
-        # If you want to send the initial message when ANY text is sent for the first time,
-        # you would need to implement state tracking (e.g., check if user_id has received welcome).
-        #
-        # Given the request, the most straightforward interpretation is:
-        # - The bot starts its Flask server and webhook.
-        # - When a user first interacts (e.g., sends /start or any text), the *first* response should be the welcome message.
-        #
-        # To trigger the "東京都" button without explicitly typing "/start",
-        # the simplest approach is to make the *initial welcome* a set of buttons.
-        # We can add a function to send the initial buttons and call it from `start` or when handling the first message.
-
-        # Let's modify the start command to send the initial button
-        # This is the most common and robust way to provide a starting point.
-        # And if users type anything else, they will get "何を言っているのか分かりません。"
-        
-        # We will make the initial message in 'start' handler include the button.
-        # To achieve "không cần nhập '/start'", a common trick for webhook is to make
-        # your `handle_message` for new users (if you track them) behave like `start`.
-        # For simplicity, I'll update the `start` command to show the button.
-        # And if a user sends *any* text, `handle_message` will kick in, potentially showing the button if it matches.
-        
-        # If you *really* want it to appear *without typing anything* after bot deployment,
-        # you need to send it to *every user that has started the bot before*.
-        # This is usually done via a broadcast feature (outside core bot logic) or specific welcome for new users.
-        # The current setup assumes the user *initiates* contact (e.g., `/start` or typing something).
-
-        # For the explicit requirement: "đưa ra nút '東京都' mà không cần nhập '/start'",
-        # the *best* way to handle this on a webhook is to have the `handle_message`
-        # check if it's the user's first interaction. If so, send the welcome.
-        # Let's modify `handle_message` slightly for this.
-
-        # This part will be handled in `handle_message` or a specific new user handler.
-        # Removed proactive send from here as it's difficult without knowing chat_id.
-
     except Exception as e:
         logger.error("Error setting Telegram webhook: %s", e)
-
 
     # --- Run Hypercorn Server ---
     logger.info("Flask app listening on port %d", PORT)
