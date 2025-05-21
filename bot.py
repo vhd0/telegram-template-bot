@@ -38,11 +38,11 @@ async def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 2. Tạo aiohttp server cho /health
+    # 2. Tạo aiohttp server cho health check
     aio_app = web.Application()
     aio_app.router.add_get("/health", healthcheck)
 
-    # 3. Chạy aiohttp site
+    # 3. Chạy aiohttp site cho /health
     runner = web.AppRunner(aio_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -51,13 +51,14 @@ async def main():
     print(f"✅ /health is running on port {PORT}")
     print("🚀 Starting Telegram bot webhook...")
 
-    # 4. Chạy webhook Telegram bot
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL,
-        stop_signals=None  # Tránh lỗi signal khi chạy trên Render
-    )
+    # 4. Khởi động bot webhook
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(WEBHOOK_URL)
+
+    # 5. Giữ chương trình chạy (đợi các tín hiệu shutdown)
+    await application.updater.start_polling()  # Hoặc: await application.updater.start_webhook() nếu cần
+    await application.wait_until_shutdown()
 
 if __name__ == '__main__':
     asyncio.run(main())
