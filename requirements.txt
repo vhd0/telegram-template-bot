@@ -3,6 +3,5 @@ aiohttp
 python-dotenv
 Flask[async]
 hypercorn
-pykakasi
 pandas
 openpyxl
