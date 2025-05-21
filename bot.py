@@ -11,7 +11,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-flask_app = Flask(__name__)
+# Khởi tạo Flask app (chỉ dùng cho health check)
+flask_app = Flask(__name__) 
 application = None # Khai báo 'application' là biến global
 
 WEBHOOK_PATH = "/webhook_telegram"
@@ -66,7 +67,6 @@ async def send_initial_key_buttons(update_object: Update):
         keyboard.append([InlineKeyboardButton(key_val, callback_data=f"{LEVEL_KEY}:{key_val}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Luôn sử dụng update_object.message.reply_text vì hàm này chỉ được gọi từ handle_message/start
     await update_object.message.reply_text("三上はじめにへようこそ")
     await update_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
 
@@ -128,7 +128,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                # Fallback to reply_text if edit fails
                 await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
@@ -185,35 +184,18 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Flask Endpoints ---
+# ĐỊNH NGHĨA ROUTE WEBHOOK BÊN NGOÀI HÀM main()
+# Route /health sẽ được Flask app xử lý, và Flask app này sẽ được truyền vào run_webhook
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint for Render's health checks."""
     return jsonify({"status": "ok"})
 
-# ĐỊNH NGHĨA ROUTE WEBHOOK BÊN NGOÀI HÀM main()
-@flask_app.route(WEBHOOK_PATH, methods=["POST"])
-async def telegram_webhook():
-    """Xử lý các cập nhật Telegram đến qua webhook."""
-    global application 
-    if application is None:
-        logger.error("Telegram Application object not initialized yet.")
-        return "Internal Server Error: Bot not ready", 500
-
-    if request.method == "POST":
-        try:
-            json_data = request.get_json(force=True)
-            if not json_data:
-                logger.warning("Received empty or invalid JSON payload from webhook.")
-                return "Bad Request", 400
-
-            update = Update.de_json(json_data, application.bot)
-            await application.process_update(update)
-            logger.info("Successfully processed Telegram update.")
-            return "ok", 200
-        except Exception as e:
-            logger.error("Error processing Telegram update: %s", e)
-            return "ok", 200
-    return "Method Not Allowed", 405
+# Route Telegram webhook sẽ được python-telegram-bot xử lý, không cần định nghĩa ở đây
+# @flask_app.route(WEBHOOK_PATH, methods=["POST"])
+# async def telegram_webhook():
+#     # ... (logic này đã được di chuyển vào application.run_webhook())
+#     pass
 
 
 # --- Global Error Handler for Application ---
@@ -245,7 +227,6 @@ if __name__ == '__main__':
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
     # Build the Application
-    # Global 'application' variable is assigned here
     application = ApplicationBuilder().token(TOKEN).build()
 
     # Add handlers
@@ -258,13 +239,15 @@ if __name__ == '__main__':
 
     logger.info("Starting Telegram Bot Application in webhook mode.")
     try:
-        # application.run_webhook() là một blocking call và nó tự quản lý event loop và việc khởi tạo.
-        # KHÔNG cần asyncio.run() hay application.initialize() riêng biệt.
+        # application.run_webhook() sẽ chạy Flask app (flask_app) trên cùng server
+        # Nó sẽ xử lý cả webhook Telegram và route /health của Flask
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=WEBHOOK_PATH,
-            webhook_url=FULL_WEBHOOK_URL
+            webhook_url=FULL_WEBHOOK_URL,
+            # Truyền Flask app vào web_server để nó được chạy cùng với bot
+            web_server=flask_app 
         )
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
