@@ -3,8 +3,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
 from flask import Flask, request, jsonify 
-# Không cần import asyncio nếu không quản lý event loop thủ công
-# import asyncio 
 import pandas as pd 
 
 # --- Configuration ---
@@ -14,8 +12,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 flask_app = Flask(__name__)
-# application sẽ được gán giá trị ở điểm vào chính
-application = None 
+application = None # Khai báo 'application' là biến global
 
 WEBHOOK_PATH = "/webhook_telegram"
 
@@ -58,7 +55,7 @@ LEVEL_REP3 = "rep3" # Cấp độ này chỉ ra đây là phản hồi văn bả
 welcomed_users = set()
 
 # --- Hàm gửi các nút cấp độ đầu tiên ---
-async def send_initial_key_buttons(update_or_message_object):
+async def send_initial_key_buttons(update_object: Update):
     """Gửi tin nhắn chào mừng và các nút cấp độ 'Key' ban đầu."""
     initial_keys = set()
     for row in DATA_TABLE:
@@ -69,20 +66,9 @@ async def send_initial_key_buttons(update_or_message_object):
         keyboard.append([InlineKeyboardButton(key_val, callback_data=f"{LEVEL_KEY}:{key_val}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    if isinstance(update_or_message_object, Update):
-        await update_or_message_object.message.reply_text("三上はじめにへようこそ")
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
-    else:
-        # Nếu là từ một query (ví dụ: muốn hiển thị lại nút ban đầu sau khi lỗi)
-        # Cần kiểm tra xem update_or_message_object có phải là CallbackQuery không
-        # Nếu là CallbackQuery, dùng query.edit_message_text
-        # Nếu không, dùng update.message.reply_text (nếu có message)
-        if hasattr(update_or_message_object, 'edit_message_text'): # Là CallbackQuery
-            await update_or_message_object.edit_message_text(text="以下の選択肢からお選びください:", reply_markup=reply_markup)
-        elif hasattr(update_or_message_object, 'message') and update_or_message_object.message: # Là Update object có message
-            await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
-        else: # Trường hợp không xác định
-            logger.warning("send_initial_key_buttons received unexpected object type: %s", type(update_or_message_object))
+    # Luôn sử dụng update_object.message.reply_text vì hàm này chỉ được gọi từ handle_message/start
+    await update_object.message.reply_text("三上はじめにへようこそ")
+    await update_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
 
 
 # --- Telegram Bot Handlers ---
@@ -142,6 +128,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
+                # Fallback to reply_text if edit fails
                 await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
@@ -229,12 +216,24 @@ async def telegram_webhook():
     return "Method Not Allowed", 405
 
 
+# --- Global Error Handler for Application ---
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the developer."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    # Bạn có thể thêm logic để gửi thông báo lỗi đến một admin chat_id cụ thể ở đây
+    # if context.bot and update:
+    #     try:
+    #         await context.bot.send_message(chat_id=YOUR_ADMIN_CHAT_ID, text=f"Error: {context.error}\nUpdate: {update}")
+    #     except Exception as send_error:
+    #         logger.error(f"Failed to send error notification: {send_error}")
+
+
 # --- Main Application Logic (Entry Point) ---
 if __name__ == '__main__':
-    # Get environment variables directly here, as this is the main entry point
+    # Lấy các biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443))
+    PORT = int(os.getenv("PORT", 8443)) 
 
     if not TOKEN:
         logger.critical("BOT_TOKEN environment variable not set. Exiting.")
@@ -253,11 +252,14 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
+    
+    # Thêm error handler vào Application
+    application.add_error_handler(error_handler)
 
     logger.info("Starting Telegram Bot Application in webhook mode.")
     try:
         # application.run_webhook() là một blocking call và nó tự quản lý event loop và việc khởi tạo.
-        # Không cần asyncio.run() hay application.initialize() riêng biệt.
+        # KHÔNG cần asyncio.run() hay application.initialize() riêng biệt.
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
