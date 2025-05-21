@@ -1,4 +1,4 @@
-import logging # THÊM DÒNG NÀY
+import logging 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
@@ -69,9 +69,9 @@ async def send_initial_key_buttons(update_or_message_object):
 
     if isinstance(update_or_message_object, Update):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
+        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
     else:
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
+        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
 
 
 # --- Telegram Bot Handlers ---
@@ -131,7 +131,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
+                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n情報が見つかりません。")
@@ -155,7 +155,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP2: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
+                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup) 
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n情報が見つかりません。")
@@ -218,13 +218,9 @@ async def telegram_webhook():
     return "Method Not Allowed", 405
 
 
-# --- Main Application Logic ---
-if __name__ == '__main__':
-    application = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(handle_button_press))
+# --- Main Application Logic (async entry point) ---
+async def run_bot_application():
+    global application
 
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -239,16 +235,28 @@ if __name__ == '__main__':
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_button_press))
+
     logger.info("Starting Telegram Bot Application in webhook mode.")
+    # Initialize the application
+    await application.initialize() 
+    
+    # Run the webhook server (this is the long-running task)
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=FULL_WEBHOOK_URL
+    )
+
+# --- Entry Point ---
+if __name__ == '__main__':
     try:
-        # application.initialize() cần được gọi trước run_webhook
-        # Nó là một coroutine, nên cần được awaited
-        asyncio.run(application.initialize()) 
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=FULL_WEBHOOK_URL
-        )
+        # Chạy hàm bất đồng bộ chính
+        asyncio.run(run_bot_application())
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
