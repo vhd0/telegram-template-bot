@@ -3,7 +3,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
 from flask import Flask, request, jsonify 
-import asyncio
+# Không cần import asyncio nếu không quản lý event loop thủ công
+# import asyncio 
 import pandas as pd 
 
 # --- Configuration ---
@@ -13,7 +14,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 flask_app = Flask(__name__)
-application = None # Khai báo 'application' là biến global
+# application sẽ được gán giá trị ở điểm vào chính
+application = None 
 
 WEBHOOK_PATH = "/webhook_telegram"
 
@@ -71,7 +73,16 @@ async def send_initial_key_buttons(update_or_message_object):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
         await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
     else:
-        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
+        # Nếu là từ một query (ví dụ: muốn hiển thị lại nút ban đầu sau khi lỗi)
+        # Cần kiểm tra xem update_or_message_object có phải là CallbackQuery không
+        # Nếu là CallbackQuery, dùng query.edit_message_text
+        # Nếu không, dùng update.message.reply_text (nếu có message)
+        if hasattr(update_or_message_object, 'edit_message_text'): # Là CallbackQuery
+            await update_or_message_object.edit_message_text(text="以下の選択肢からお選びください:", reply_markup=reply_markup)
+        elif hasattr(update_or_message_object, 'message') and update_or_message_object.message: # Là Update object có message
+            await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+        else: # Trường hợp không xác định
+            logger.warning("send_initial_key_buttons received unexpected object type: %s", type(update_or_message_object))
 
 
 # --- Telegram Bot Handlers ---
@@ -218,13 +229,12 @@ async def telegram_webhook():
     return "Method Not Allowed", 405
 
 
-# --- Main Application Logic (async entry point) ---
-async def run_bot_application():
-    global application
-
+# --- Main Application Logic (Entry Point) ---
+if __name__ == '__main__':
+    # Get environment variables directly here, as this is the main entry point
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443)) 
+    PORT = int(os.getenv("PORT", 8443))
 
     if not TOKEN:
         logger.critical("BOT_TOKEN environment variable not set. Exiting.")
@@ -235,28 +245,24 @@ async def run_bot_application():
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
+    # Build the Application
+    # Global 'application' variable is assigned here
     application = ApplicationBuilder().token(TOKEN).build()
 
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
 
     logger.info("Starting Telegram Bot Application in webhook mode.")
-    # Initialize the application
-    await application.initialize() 
-    
-    # Run the webhook server (this is the long-running task)
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=FULL_WEBHOOK_URL
-    )
-
-# --- Entry Point ---
-if __name__ == '__main__':
     try:
-        # Chạy hàm bất đồng bộ chính
-        asyncio.run(run_bot_application())
+        # application.run_webhook() là một blocking call và nó tự quản lý event loop và việc khởi tạo.
+        # Không cần asyncio.run() hay application.initialize() riêng biệt.
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=FULL_WEBHOOK_URL
+        )
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
