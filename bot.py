@@ -2,8 +2,11 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
-from flask import Flask, request, jsonify 
+# Không cần Flask nếu chỉ dùng cho health check và run_webhook không hỗ trợ web_server
+# from flask import Flask, request, jsonify 
 import pandas as pd 
+# Import aiohttp để tạo health check handler thủ công
+from aiohttp import web 
 
 # --- Configuration ---
 logging.basicConfig(
@@ -11,8 +14,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Khởi tạo Flask app (chỉ dùng cho health check)
-flask_app = Flask(__name__) 
+# Không cần flask_app nếu không dùng Flask cho các route khác
+# flask_app = Flask(__name__) 
 application = None # Khai báo 'application' là biến global
 
 WEBHOOK_PATH = "/webhook_telegram"
@@ -68,7 +71,7 @@ async def send_initial_key_buttons(update_object: Update):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update_object.message.reply_text("三上はじめにへようこそ")
-    await update_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
+    await update_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) 
 
 
 # --- Telegram Bot Handlers ---
@@ -183,19 +186,10 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text("不明な操作です。")
 
 
-# --- Flask Endpoints ---
-# ĐỊNH NGHĨA ROUTE WEBHOOK BÊN NGOÀI HÀM main()
-# Route /health sẽ được Flask app xử lý, và Flask app này sẽ được truyền vào run_webhook
-@flask_app.route("/health", methods=["GET"])
-def health_check():
-    """Endpoint for Render's health checks."""
-    return jsonify({"status": "ok"})
-
-# Route Telegram webhook sẽ được python-telegram-bot xử lý, không cần định nghĩa ở đây
-# @flask_app.route(WEBHOOK_PATH, methods=["POST"])
-# async def telegram_webhook():
-#     # ... (logic này đã được di chuyển vào application.run_webhook())
-#     pass
+# --- Health Check Handler for aiohttp ---
+# Hàm này sẽ được gọi khi Render kiểm tra endpoint /health
+async def health_check_handler(request):
+    return web.json_response({"status": "ok"})
 
 
 # --- Global Error Handler for Application ---
@@ -239,15 +233,19 @@ if __name__ == '__main__':
 
     logger.info("Starting Telegram Bot Application in webhook mode.")
     try:
-        # application.run_webhook() sẽ chạy Flask app (flask_app) trên cùng server
-        # Nó sẽ xử lý cả webhook Telegram và route /health của Flask
+        # Tạo một aiohttp.web.Application để làm server web
+        # và thêm route /health vào đó.
+        custom_web_server = web.Application()
+        custom_web_server.router.add_get("/health", health_check_handler)
+
+        # application.run_webhook() sẽ chạy custom_web_server này
+        # và thêm route webhook của Telegram vào đó.
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=WEBHOOK_PATH,
             webhook_url=FULL_WEBHOOK_URL,
-            # Truyền Flask app vào web_server để nó được chạy cùng với bot
-            web_server=flask_app 
+            web_server=custom_web_server # TRUYỀN aiohttp.web.Application VÀO ĐÂY
         )
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
