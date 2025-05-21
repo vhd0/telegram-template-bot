@@ -1,3 +1,4 @@
+import logging # THÊM DÒNG NÀY
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
@@ -68,9 +69,9 @@ async def send_initial_key_buttons(update_or_message_object):
 
     if isinstance(update_or_message_object, Update):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
-        await update_or_message_object.message.reply_text("以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
+        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
     else:
-        await update_or_message_object.message.reply_text("以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
+        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
 
 
 # --- Telegram Bot Handlers ---
@@ -130,7 +131,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
+                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_key}\n情報が見つかりません。")
@@ -154,7 +155,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP2: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択選項からお選びください:", reply_markup=reply_markup) # Sửa lỗi chính tả
+                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup) # Đã sửa lỗi chính tả
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_rep1}\n情報が見つかりません。")
@@ -218,21 +219,16 @@ async def telegram_webhook():
 
 
 # --- Main Application Logic ---
-# Loại bỏ async def main() và asyncio.run(main())
-# Thay vào đó, chạy trực tiếp application.run_webhook()
 if __name__ == '__main__':
-    # Khởi tạo application ở đây
     application = ApplicationBuilder().token(os.getenv("BOT_TOKEN")).build()
 
-    # Thêm các handler
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
 
-    # Lấy các biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443)) # Render thường dùng 10000, nhưng 8443 cũng phổ biến
+    PORT = int(os.getenv("PORT", 8443)) 
 
     if not TOKEN:
         logger.critical("BOT_TOKEN environment variable not set. Exiting.")
@@ -243,20 +239,11 @@ if __name__ == '__main__':
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-    # Thiết lập Webhook Telegram (có thể cần await)
-    # Tuy nhiên, run_webhook() sẽ tự động gọi set_webhook()
-    # Nên chúng ta có thể bỏ qua việc gọi set_webhook() ở đây để tránh trùng lặp
-    # và để run_webhook() quản lý hoàn toàn.
-    # logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
-    # try:
-    #     asyncio.run(application.bot.set_webhook(url=FULL_WEBHOOK_URL))
-    #     logger.info("Telegram webhook set successfully.")
-    # except Exception as e:
-    #     logger.error("Error setting Telegram webhook: %s", e)
-
-    # Chạy Telegram Bot Application trong chế độ webhook
     logger.info("Starting Telegram Bot Application in webhook mode.")
     try:
+        # application.initialize() cần được gọi trước run_webhook
+        # Nó là một coroutine, nên cần được awaited
+        asyncio.run(application.initialize()) 
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
