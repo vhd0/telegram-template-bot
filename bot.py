@@ -1,12 +1,13 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify # Giữ Flask và request
 import asyncio
-from hypercorn.asyncio import serve
-from hypercorn.config import Config
+# Loại bỏ hypercorn imports vì telegram-bot sẽ quản lý server webhook nội bộ
+# from hypercorn.asyncio import serve
+# from hypercorn.config import Config
 import logging
-import pandas as pd # Import pandas
+import pandas as pd
 
 # --- Configuration ---
 logging.basicConfig(
@@ -39,7 +40,6 @@ try:
 
 except FileNotFoundError:
     logger.critical(f"Error: {EXCEL_FILE_PATH} not found. Please ensure it's in the root directory.")
-    # Dừng ứng dụng nếu không tìm thấy file dữ liệu quan trọng
     raise SystemExit("Required data file not found. Exiting.")
 except ValueError as ve:
     logger.critical(f"Error in Excel file format: {ve}")
@@ -61,14 +61,12 @@ welcomed_users = set()
 # --- Hàm gửi các nút cấp độ đầu tiên ---
 async def send_initial_key_buttons(update_or_message_object):
     """Gửi tin nhắn chào mừng và các nút cấp độ 'Key' ban đầu."""
-    # Lấy các giá trị 'Key' duy nhất từ DATA_TABLE để hiển thị trên nút và dùng cho callback_data
     initial_keys = set()
     for row in DATA_TABLE:
         initial_keys.add(row["Key"])
 
     keyboard = []
     for key_val in sorted(list(initial_keys)):
-        # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
         keyboard.append([InlineKeyboardButton(key_val, callback_data=f"{LEVEL_KEY}:{key_val}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -76,8 +74,6 @@ async def send_initial_key_buttons(update_or_message_object):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
         await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
     else:
-        # Trường hợp này có thể xảy ra nếu edit_message_text được gọi nhưng không thành công
-        # hoặc nếu bạn muốn reset menu từ một callback không mong muốn.
         await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
 
 
@@ -86,16 +82,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Phản hồi tin nhắn người dùng, xử lý chào mừng lần đầu."""
     user_id = update.message.from_user.id
 
-    # Nếu đây là lần đầu tiên người dùng tương tác, gửi tin nhắn chào mừng và nút ban đầu
     if user_id not in welcomed_users:
         await send_initial_key_buttons(update)
-        welcomed_users.add(user_id) # Đánh dấu người dùng đã được chào mừng
-        return # Dừng xử lý tin nhắn này
-
-    # Nếu người dùng đã được chào mừng và gõ bất kỳ văn bản nào khác, bot chỉ báo không hiểu
+        welcomed_users.add(user_id)
+        return
+    
     if update.message and update.message.text:
         logger.info(f"Received unexpected text from welcomed user: '{update.message.text}'")
-        await update.message.reply_text("何を言っているのか分かりません。ボタンを使用してください。") # Yêu cầu người dùng sử dụng nút
+        await update.message.reply_text("何を言っているのか分かりません。ボタンを使用してください。")
     else:
         logger.warning("Received an update without message text from welcomed user: %s", update)
 
@@ -103,11 +97,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý lệnh /start - sẽ kích hoạt logic chào mừng nếu người dùng chưa được chào mừng."""
     user_id = update.message.from_user.id
-    if user_id not in welcomed_users: # Để tránh chào mừng hai lần nếu /start được gửi sau khi đã chào mừng
+    if user_id not in welcomed_users:
         await send_initial_key_buttons(update)
         welcomed_users.add(user_id)
     else:
-        await update.message.reply_text("すでにようこそ！") # Tin nhắn đã chào mừng
+        await update.message.reply_text("すでにようこそ！")
 
 
 async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,10 +110,9 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await query.answer() 
 
-    # Phân tích callback_data: level:key_val:rep1_val:rep2_val
     data_parts = query.data.split(':')
     current_level = data_parts[0]
-    selected_key = data_parts[1] # Đây là giá trị trực tiếp từ Excel
+    selected_key = data_parts[1]
     selected_rep1 = data_parts[2] if len(data_parts) > 2 else ''
     selected_rep2 = data_parts[3] if len(data_parts) > 3 else ''
 
@@ -134,7 +127,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         if next_rep1_values:
             keyboard = []
             for rep1_val in sorted(list(next_rep1_values)):
-                # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
                 keyboard.append([InlineKeyboardButton(rep1_val, callback_data=f"{LEVEL_REP1}:{selected_key}:{rep1_val}:")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -159,7 +151,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         if next_rep2_values:
             keyboard = []
             for rep2_val in sorted(list(next_rep2_values)):
-                # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
                 keyboard.append([InlineKeyboardButton(rep2_val, callback_data=f"{LEVEL_REP2}:{selected_key}:{selected_rep1}:{rep2_val}")])
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -177,7 +168,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif current_level == LEVEL_REP2:
         final_text = "情報が見つかりません。"
-        # Dùng DATA_TABLE gốc để lấy Rep3
         for row in DATA_TABLE: 
             if row["Key"] == selected_key and \
                row["Rep1"] == selected_rep1 and \
@@ -205,11 +195,11 @@ def health_check():
     """Endpoint for Render's health checks."""
     return jsonify({"status": "ok"})
 
-# Định nghĩa ROUTE WEBHOOK BÊN NGOÀI HÀM main()
+# ĐỊNH NGHĨA ROUTE WEBHOOK BÊN NGOÀI HÀM main()
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 async def telegram_webhook():
     """Xử lý các cập nhật Telegram đến qua webhook."""
-    global application # Truy cập biến global 'application'
+    global application
     if application is None:
         logger.error("Telegram Application object not initialized yet.")
         return "Internal Server Error: Bot not ready", 500
@@ -234,7 +224,7 @@ async def telegram_webhook():
 # --- Main Application Logic ---
 async def main():
     """Hàm chính để khởi tạo và chạy bot Telegram và server Flask."""
-    global application # Gán giá trị cho biến global 'application'
+    global application
 
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -253,13 +243,11 @@ async def main():
 
     await application.initialize()
 
-    # Thêm các handler
     application.add_handler(CommandHandler("start", start))
-    # MessageHandler chỉ còn nhiệm vụ chào mừng người dùng mới
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
 
-    # --- Thiết lập Webhook Telegram ---
+    # --- Set Telegram Webhook ---
     logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
     try:
         await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
@@ -267,17 +255,23 @@ async def main():
     except Exception as e:
         logger.error("Error setting Telegram webhook: %s", e)
 
-    # --- Chạy Server Hypercorn ---
-    logger.info("Flask app listening on port %d", PORT)
-    config = Config()
-    config.bind = [f"0.0.0.0:{PORT}"]
+    # --- Run Application with Webhook Server ---
+    # Đây là cách chính xác để chạy Telegram bot trong chế độ webhook với Flask.
+    # Nó sẽ quản lý event loop và server một cách nội bộ.
+    logger.info("Starting Telegram Bot Application in webhook mode.")
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=FULL_WEBHOOK_URL
+    )
 
-    server_task = asyncio.create_task(serve(flask_app, config))
-    await server_task
-
-# --- Điểm vào ---
+# --- Entry Point ---
 if __name__ == '__main__':
     try:
+        # asyncio.run() sẽ tạo và quản lý event loop.
+        # application.run_webhook() sẽ chạy trên event loop đó.
+        # Không cần Hypercorn.
         asyncio.run(main())
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
