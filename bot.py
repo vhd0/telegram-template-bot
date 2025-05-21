@@ -1,5 +1,6 @@
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from aiohttp import web  # 👈 THÊM DÒNG NÀY
 import os
 
 TEMPLATE_REPLIES = {
@@ -16,21 +17,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("三上はじめにへようこそ")
 
+async def healthcheck(request):  # 👈 THÊM ROUTE /health
+    return web.Response(text="OK", status=200)
+
 if __name__ == '__main__':
     from telegram.ext import Application
 
-    # Lấy token và URL từ biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ví dụ: "https://your-domain.com/your-path"
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    PORT = int(os.getenv("PORT", 8443))
 
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Starting webhook...")
+    # Khởi tạo aiohttp server
+    aio_app = web.Application()
+    aio_app.router.add_get("/health", healthcheck)  # 👈 THÊM ROUTE /health
+
+    # Gắn bot telegram vào aiohttp
     app.run_webhook(
         listen="0.0.0.0",
-        port=int(os.getenv("PORT", 8443)),  # Có thể dùng 443 hoặc 8443 tùy platform
+        port=PORT,
         webhook_url=WEBHOOK_URL,
+        web_app=aio_app  # 👈 LIÊN KẾT WEBHOOK VỚI HTTP SERVER
     )
