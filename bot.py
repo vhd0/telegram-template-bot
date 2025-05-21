@@ -2,11 +2,11 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import os
-# Không cần Flask nếu chỉ dùng cho health check và run_webhook không hỗ trợ web_server
-# from flask import Flask, request, jsonify 
+from flask import Flask, request, jsonify # Giữ Flask và request
+import asyncio
+from hypercorn.asyncio import serve # Import lại serve từ hypercorn
+from hypercorn.config import Config # Import lại Config từ hypercorn
 import pandas as pd 
-# Import aiohttp để tạo health check handler thủ công
-from aiohttp import web 
 
 # --- Configuration ---
 logging.basicConfig(
@@ -14,9 +14,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Không cần flask_app nếu không dùng Flask cho các route khác
-# flask_app = Flask(__name__) 
-application = None # Khai báo 'application' là biến global
+flask_app = Flask(__name__)
+# application sẽ được gán giá trị ở hàm main_run_function
+application = None 
 
 WEBHOOK_PATH = "/webhook_telegram"
 
@@ -186,10 +186,38 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text("不明な操作です。")
 
 
-# --- Health Check Handler for aiohttp ---
-# Hàm này sẽ được gọi khi Render kiểm tra endpoint /health
-async def health_check_handler(request):
-    return web.json_response({"status": "ok"})
+# --- Flask Endpoints ---
+# Định nghĩa route webhook của Flask
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+async def telegram_webhook():
+    """Xử lý các cập nhật Telegram đến qua webhook."""
+    global application 
+    if application is None:
+        logger.error("Telegram Application object not initialized yet.")
+        return "Internal Server Error: Bot not ready", 500
+
+    if request.method == "POST":
+        try:
+            json_data = request.get_json(force=True)
+            if not json_data:
+                logger.warning("Received empty or invalid JSON payload from webhook.")
+                return "Bad Request", 400
+
+            # Xử lý update bằng Application của python-telegram-bot
+            update = Update.de_json(json_data, application.bot)
+            await application.process_update(update)
+            logger.info("Successfully processed Telegram update.")
+            return "ok", 200
+        except Exception as e:
+            logger.error("Error processing Telegram update: %s", e)
+            return "ok", 200 # Luôn trả về 200 OK để Telegram không thử lại liên tục
+    return "Method Not Allowed", 405
+
+# Endpoint health check của Flask
+@flask_app.route("/health", methods=["GET"])
+def health_check():
+    """Endpoint for Render's health checks."""
+    return jsonify({"status": "ok"})
 
 
 # --- Global Error Handler for Application ---
@@ -205,7 +233,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # --- Main Application Logic (Entry Point) ---
-if __name__ == '__main__':
+# Hàm async chính để chạy toàn bộ ứng dụng
+async def run_full_application():
+    global application
+
     # Lấy các biến môi trường
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -220,32 +251,42 @@ if __name__ == '__main__':
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-    # Build the Application
+    # Build the Application của python-telegram-bot
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Add handlers
+    # Thêm handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
-    
-    # Thêm error handler vào Application
     application.add_error_handler(error_handler)
 
-    logger.info("Starting Telegram Bot Application in webhook mode.")
-    try:
-        # Tạo một aiohttp.web.Application để làm server web
-        # và thêm route /health vào đó.
-        custom_web_server = web.Application()
-        custom_web_server.router.add_get("/health", health_check_handler)
+    # Khởi tạo Application của python-telegram-bot
+    # Điều này cần được gọi trước khi bot tương tác với Telegram API
+    await application.initialize() 
 
-        # application.run_webhook() sẽ chạy custom_web_server này
-        # và thêm route webhook của Telegram vào đó.
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_PATH,
-            webhook_url=FULL_WEBHOOK_URL,
-            web_server=custom_web_server # TRUYỀN aiohttp.web.Application VÀO ĐÂY
-        )
+    # Thiết lập Telegram webhook
+    logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
+    try:
+        await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
+        logger.info("Telegram webhook set successfully.")
+    except Exception as e:
+        logger.error("Error setting Telegram webhook: %s", e)
+        # Nếu webhook không thiết lập được, có thể bot sẽ không hoạt động
+        # Bạn có thể chọn raise lỗi ở đây nếu muốn dừng triển khai
+        # raise
+
+    # Chạy Hypercorn để phục vụ Flask app (bao gồm cả webhook Telegram và health check)
+    logger.info("Flask app (via Hypercorn) listening on port %d", PORT)
+    config = Config()
+    config.bind = [f"0.0.0.0:{PORT}"]
+    
+    # serve là một coroutine và sẽ chạy vô thời hạn, giữ event loop mở
+    await serve(flask_app, config)
+
+
+if __name__ == '__main__':
+    try:
+        # Chạy hàm async chính bằng asyncio.run()
+        asyncio.run(run_full_application())
     except Exception as e:
         logger.critical("Application stopped due to an unhandled error: %s", e)
