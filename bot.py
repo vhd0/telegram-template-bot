@@ -77,6 +77,11 @@ LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 LEVEL_REP3 = "rep3" # Cấp độ này chỉ ra đây là phản hồi văn bản cuối cùng
 
+# Thông tin kênh chat và hướng dẫn
+TELEGRAM_CHANNEL_LINK = "https://t.me/+JlQulVIHX5AwOGVI"
+INSTRUCTION_MESSAGE_JP = f"受け取った番号を、到着の10分前までにこちらのチャンネル <a href='{TELEGRAM_CHANNEL_LINK}'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！"
+
+
 # Set để lưu trữ user_id đã được chào mừng (sẽ bị reset khi bot khởi động lại)
 welcomed_users = set()
 
@@ -221,11 +226,15 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 final_text = row["Rep3"]
                 break
         
+        # Thêm hướng dẫn và link vào final_text
+        full_response_text = f"{final_text}\n\n{INSTRUCTION_MESSAGE_JP}"
+
         try:
-            await query.edit_message_text(text=f"選択されました: {selected_rep2_display}\n詳細情報:\n{final_text}\nありがとうございました。")
+            # Sử dụng parse_mode='HTML' để link được hiển thị đúng
+            await query.edit_message_text(text=full_response_text, parse_mode='HTML')
         except Exception as e:
             logger.warning("Could not edit message (final): %s - %s", query.message.message_id, e)
-            await query.message.reply_text(f"選択されました: {selected_rep2_display}\n詳細情報:\n{final_text}\nありがとうございました。")
+            await query.message.reply_text(text=full_response_text, parse_mode='HTML')
 
     else:
         try:
