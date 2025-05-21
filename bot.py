@@ -50,6 +50,7 @@ if __name__ == '__main__':
     
     # Hàm xử lý webhook của Telegram thông qua Flask
     # Flask sẽ lắng nghe trên đường dẫn cố định đã định nghĩa
+    # Lưu ý: Hàm này là async, nên cần Flask được cài đặt với extra 'async' (pip install Flask[async])
     @flask_app.route(WEBHOOK_PATH, methods=["POST"])
     async def telegram_webhook():
         if request.method == "POST":
