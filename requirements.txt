@@ -5,5 +5,3 @@ pandas
 openpyxl
 Flask[async]
 hypercorn
-firebase-admin
-PyJWT # THÊM DÒNG NÀY
