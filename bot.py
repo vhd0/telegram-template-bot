@@ -1,7 +1,8 @@
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import os
-from flask import Flask, request, jsonify # Thêm Flask
+from flask import Flask, request, jsonify
+import asyncio # Thêm asyncio
 
 # Khởi tạo Flask app
 flask_app = Flask(__name__)
@@ -50,7 +51,13 @@ if __name__ == '__main__':
     # Đặt webhook cho Telegram bot
     # Đây là bước quan trọng để Telegram biết gửi update về đâu
     print(f"Setting Telegram webhook to: {WEBHOOK_URL}")
-    application.run_once(application.bot.set_webhook(url=WEBHOOK_URL))
+    
+    # Sử dụng asyncio.run để chạy hàm async set_webhook() một lần
+    try:
+        asyncio.run(application.bot.set_webhook(url=WEBHOOK_URL))
+        print("Telegram webhook set successfully.")
+    except Exception as e:
+        print(f"Error setting Telegram webhook: {e}")
 
     # Chạy Flask app để lắng nghe các yêu cầu HTTP (bao gồm /health và webhook)
     print(f"Flask app listening on port {PORT}")
