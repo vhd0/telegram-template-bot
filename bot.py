@@ -6,8 +6,7 @@ import asyncio
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 import logging
-from pykakasi import kakasi
-import pandas as pd
+import pandas as pd # Import pandas
 
 # --- Configuration ---
 logging.basicConfig(
@@ -20,39 +19,10 @@ application = None # Khai báo 'application' là biến global
 
 WEBHOOK_PATH = "/webhook_telegram"
 
-# Initialize Kakasi for text conversion to Kanji
-kks = kakasi()
-kks.setMode("H", "J") # Convert Hiragana to Kanji
-kks.setMode("K", "J") # Convert Katakana to Kanji
-kks.setMode("J", "J") # Keep Kanji as is
-converter = kks.getConverter()
-
-# --- Utility Function to Normalize Japanese Input to Kanji ---
-def normalize_japanese_input(text: str) -> str:
-    """Converts Japanese text (Hiragana/Katakana/Kanji) to its Kanji representation for consistent matching."""
-    return converter.do(text)
-
 # --- Bot Data Structure ---
 # Đường dẫn đến file Excel
 EXCEL_FILE_PATH = "rep.xlsx"
 DATA_TABLE = [] # Khởi tạo rỗng, sẽ được điền từ Excel
-NORMALIZED_DATA_TABLE = [] # Sẽ chứa các giá trị Kanji (đã qua normalize_japanese_input)
-
-# Hàm để chuẩn hóa các khóa 'Key', 'Rep1', 'Rep2' trong DATA_TABLE sang Kanji
-# (Mặc dù chúng ta giả định chúng đã là Kanji, nhưng hàm này sẽ đảm bảo tính nhất quán)
-def normalize_data_table_keys(table):
-    normalized_table = []
-    for row in table:
-        normalized_row = {}
-        for k, v in row.items():
-            original_val = str(v) # Đảm bảo giá trị là chuỗi
-            if k in ["Key", "Rep1", "Rep2"]:
-                # Chuẩn hóa sang Kanji. Nếu đã là Kanji, sẽ giữ nguyên.
-                normalized_row[k] = normalize_japanese_input(original_val)
-            else:
-                normalized_row[k] = original_val # Rep3 là văn bản cuối cùng, không cần chuẩn hóa
-        normalized_table.append(normalized_row)
-    return normalized_table
 
 # --- Tải dữ liệu từ Excel ---
 try:
@@ -63,15 +33,13 @@ try:
         raise ValueError(f"File Excel phải có các cột: {', '.join(required_columns)}")
 
     # Chuyển đổi DataFrame thành danh sách các dictionary
-    DATA_TABLE = df.to_dict(orient='records')
+    # Đảm bảo tất cả các giá trị được chuyển thành chuỗi để tránh lỗi so khớp
+    DATA_TABLE = df.astype(str).to_dict(orient='records')
     logger.info(f"Successfully loaded data from {EXCEL_FILE_PATH}")
-
-    # Gọi hàm chuẩn hóa dữ liệu
-    NORMALIZED_DATA_TABLE = normalize_data_table_keys(DATA_TABLE)
-    logger.info("Data table normalized successfully.")
 
 except FileNotFoundError:
     logger.critical(f"Error: {EXCEL_FILE_PATH} not found. Please ensure it's in the root directory.")
+    # Dừng ứng dụng nếu không tìm thấy file dữ liệu quan trọng
     raise SystemExit("Required data file not found. Exiting.")
 except ValueError as ve:
     logger.critical(f"Error in Excel file format: {ve}")
@@ -93,65 +61,43 @@ welcomed_users = set()
 # --- Hàm gửi các nút cấp độ đầu tiên ---
 async def send_initial_key_buttons(update_or_message_object):
     """Gửi tin nhắn chào mừng và các nút cấp độ 'Key' ban đầu."""
-    # Lấy các giá trị 'Key' đã chuẩn hóa (Kanji) duy nhất để hiển thị và dùng cho callback_data
-    initial_keys_normalized = {row["Key"] for row in NORMALIZED_DATA_TABLE}
+    # Lấy các giá trị 'Key' duy nhất từ DATA_TABLE để hiển thị trên nút và dùng cho callback_data
+    initial_keys = set()
+    for row in DATA_TABLE:
+        initial_keys.add(row["Key"])
 
     keyboard = []
-    for key_val_normalized in sorted(list(initial_keys_normalized)):
-        # Hiển thị và callback_data đều là giá trị Kanji đã chuẩn hóa
-        keyboard.append([InlineKeyboardButton(key_val_normalized, callback_data=f"{LEVEL_KEY}:{key_val_normalized}::")])
+    for key_val in sorted(list(initial_keys)):
+        # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
+        keyboard.append([InlineKeyboardButton(key_val, callback_data=f"{LEVEL_KEY}:{key_val}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if isinstance(update_or_message_object, Update):
         await update_or_message_object.message.reply_text("三上はじめにへようこそ")
         await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
     else:
-        await update_or_message_object.edit_message_text(text="以下の選択肢からお選びください:", reply_markup=reply_markup)
+        # Trường hợp này có thể xảy ra nếu edit_message_text được gọi nhưng không thành công
+        # hoặc nếu bạn muốn reset menu từ một callback không mong muốn.
+        await update_or_message_object.message.reply_text("以下の選択肢からお選びください:", reply_markup=reply_markup)
 
 
 # --- Telegram Bot Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Phản hồi tin nhắn người dùng, xử lý chào mừng lần đầu và tìm kiếm theo văn bản."""
+    """Phản hồi tin nhắn người dùng, xử lý chào mừng lần đầu."""
     user_id = update.message.from_user.id
 
     # Nếu đây là lần đầu tiên người dùng tương tác, gửi tin nhắn chào mừng và nút ban đầu
     if user_id not in welcomed_users:
         await send_initial_key_buttons(update)
         welcomed_users.add(user_id) # Đánh dấu người dùng đã được chào mừng
-        return # Dừng xử lý tin nhắn này vì nó là tin nhắn chào mừng
+        return # Dừng xử lý tin nhắn này
 
-    # Nếu người dùng đã được chào mừng, xử lý đầu vào của họ bình thường
+    # Nếu người dùng đã được chào mừng và gõ bất kỳ văn bản nào khác, bot chỉ báo không hiểu
     if update.message and update.message.text:
-        user_input_raw = update.message.text
-        # Chuẩn hóa đầu vào người dùng sang Kanji để so khớp
-        user_input_normalized = normalize_japanese_input(user_input_raw) 
-        
-        logger.info(f"Received text: '{user_input_raw}', Normalized: '{user_input_normalized}'")
-
-        # Lấy các khóa 'Key' đã chuẩn hóa duy nhất để so sánh
-        unique_keys_normalized = {row["Key"] for row in NORMALIZED_DATA_TABLE}
-
-        if user_input_normalized in unique_keys_normalized:
-            # Người dùng đã gõ một 'Key' ban đầu. Hiển thị các nút Rep1 cho Key này.
-            next_normalized_rep1_values = set()
-            for row in NORMALIZED_DATA_TABLE:
-                if row["Key"] == user_input_normalized:
-                    next_normalized_rep1_values.add(row["Rep1"])
-            
-            if next_normalized_rep1_values:
-                keyboard = []
-                for rep1_val_normalized in sorted(list(next_normalized_rep1_values)):
-                    # Hiển thị và callback_data đều là giá trị Kanji đã chuẩn hóa
-                    keyboard.append([InlineKeyboardButton(rep1_val_normalized, callback_data=f"{LEVEL_REP1}:{user_input_normalized}:{rep1_val_normalized}:")])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text(text=f"選択されました: {user_input_normalized}\n次に進んでください:", reply_markup=reply_markup)
-            else:
-                await update.message.reply_text(text=f"選択されました: {user_input_normalized}\n情報が見つかりません。")
-        else:
-            # Văn bản nhập vào không khớp với bất kỳ 'Key' nào
-            await update.message.reply_text("何を言っているのか分かりません。もう一度お試しください。")
+        logger.info(f"Received unexpected text from welcomed user: '{update.message.text}'")
+        await update.message.reply_text("何を言っているのか分かりません。ボタンを使用してください。") # Yêu cầu người dùng sử dụng nút
     else:
-        logger.warning("Received an update without message text: %s", update)
+        logger.warning("Received an update without message text from welcomed user: %s", update)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,83 +119,77 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Phân tích callback_data: level:key_val:rep1_val:rep2_val
     data_parts = query.data.split(':')
     current_level = data_parts[0]
-    selected_key_normalized = data_parts[1] # Đây là Kanji đã chuẩn hóa
-    selected_rep1_normalized = data_parts[2] if len(data_parts) > 2 else ''
-    selected_rep2_normalized = data_parts[3] if len(data_parts) > 3 else ''
+    selected_key = data_parts[1] # Đây là giá trị trực tiếp từ Excel
+    selected_rep1 = data_parts[2] if len(data_parts) > 2 else ''
+    selected_rep2 = data_parts[3] if len(data_parts) > 3 else ''
 
-    logger.info(f"Button press: Level={current_level}, Key={selected_key_normalized}, Rep1={selected_rep1_normalized}, Rep2={selected_rep2_normalized}")
+    logger.info(f"Button press: Level={current_level}, Key={selected_key}, Rep1={selected_rep1}, Rep2={selected_rep2}")
 
     if current_level == LEVEL_KEY:
-        next_normalized_rep1_values = set()
-        for row in NORMALIZED_DATA_TABLE:
-            if row["Key"] == selected_key_normalized:
-                next_normalized_rep1_values.add(row["Rep1"])
+        next_rep1_values = set()
+        for row in DATA_TABLE:
+            if row["Key"] == selected_key:
+                next_rep1_values.add(row["Rep1"])
         
-        if next_normalized_rep1_values:
+        if next_rep1_values:
             keyboard = []
-            for rep1_val_normalized in sorted(list(next_normalized_rep1_values)):
-                # Hiển thị và callback_data đều là giá trị Kanji đã chuẩn hóa
-                keyboard.append([InlineKeyboardButton(rep1_val_normalized, callback_data=f"{LEVEL_REP1}:{selected_key_normalized}:{rep1_val_normalized}:")])
+            for rep1_val in sorted(list(next_rep1_values)):
+                # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
+                keyboard.append([InlineKeyboardButton(rep1_val, callback_data=f"{LEVEL_REP1}:{selected_key}:{rep1_val}:")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_key_normalized}\n次に進んでください:", reply_markup=reply_markup)
+                await query.edit_message_text(text=f"選択されました: {selected_key}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP1: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key_normalized}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_key}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
         else:
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_key_normalized}\n情報が見つかりません。")
+                await query.edit_message_text(text=f"選択されました: {selected_key}\n情報が見つかりません。")
             except Exception as e:
                 logger.warning("Could not edit message for REP1 (no info): %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key_normalized}\n情報が見つかりません。")
+                await query.message.reply_text(f"選択されました: {selected_key}\n情報が見つかりません。")
 
     elif current_level == LEVEL_REP1:
-        next_normalized_rep2_values = set()
-        for row in NORMALIZED_DATA_TABLE:
-            if row["Key"] == selected_key_normalized and row["Rep1"] == selected_rep1_normalized:
-                next_normalized_rep2_values.add(row["Rep2"])
+        next_rep2_values = set()
+        for row in DATA_TABLE:
+            if row["Key"] == selected_key and row["Rep1"] == selected_rep1:
+                next_rep2_values.add(row["Rep2"])
 
-        if next_normalized_rep2_values:
+        if next_rep2_values:
             keyboard = []
-            for rep2_val_normalized in sorted(list(next_normalized_rep2_values)):
-                # Hiển thị và callback_data đều là giá trị Kanji đã chuẩn hóa
-                keyboard.append([InlineKeyboardButton(rep2_val_normalized, callback_data=f"{LEVEL_REP2}:{selected_key_normalized}:{selected_rep1_normalized}:{rep2_val_normalized}")])
+            for rep2_val in sorted(list(next_rep2_values)):
+                # Hiển thị và callback_data đều là giá trị trực tiếp từ Excel
+                keyboard.append([InlineKeyboardButton(rep2_val, callback_data=f"{LEVEL_REP2}:{selected_key}:{selected_rep1}:{rep2_val}")])
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_rep1_normalized}\n次に進んでください:", reply_markup=reply_markup)
+                await query.edit_message_text(text=f"選択されました: {selected_rep1}\n次に進んでください:", reply_markup=reply_markup)
             except Exception as e:
                 logger.warning("Could not edit message for REP2: %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1_normalized}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_rep1}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
         else:
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_rep1_normalized}\n情報が見つかりません。")
+                await query.edit_message_text(text=f"選択されました: {selected_rep1}\n情報が見つかりません。")
             except Exception as e:
                 logger.warning("Could not edit message for REP2 (no info): %s - %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1_normalized}\n情報が見つかりません。")
+                await query.message.reply_text(f"選択されました: {selected_rep1}\n情報が見つかりません。")
 
     elif current_level == LEVEL_REP2:
         final_text = "情報が見つかりません。"
-        # Dùng DATA_TABLE gốc để lấy Rep3 vì nó không được chuẩn hóa
+        # Dùng DATA_TABLE gốc để lấy Rep3
         for row in DATA_TABLE: 
-            # Chuẩn hóa các giá trị của hàng để so sánh với các giá trị đã chọn
-            # Đảm bảo chuyển đổi sang string trước khi chuẩn hóa
-            normalized_row_key = normalize_japanese_input(str(row["Key"]))
-            normalized_row_rep1 = normalize_japanese_input(str(row["Rep1"]))
-            normalized_row_rep2 = normalize_japanese_input(str(row["Rep2"]))
-
-            if normalized_row_key == selected_key_normalized and \
-               normalized_row_rep1 == selected_rep1_normalized and \
-               normalized_row_rep2 == selected_rep2_normalized:
+            if row["Key"] == selected_key and \
+               row["Rep1"] == selected_rep1 and \
+               row["Rep2"] == selected_rep2:
                 final_text = row["Rep3"]
                 break
         
         try:
-            await query.edit_message_text(text=f"選択されました: {selected_rep2_normalized}\n詳細情報:\n{final_text}\nありがとうございました。")
+            await query.edit_message_text(text=f"選択されました: {selected_rep2}\n詳細情報:\n{final_text}\nありがとうございました。")
         except Exception as e:
             logger.warning("Could not edit message (final): %s - %s", query.message.message_id, e)
-            await query.message.reply_text(f"選択されました: {selected_rep2_normalized}\n詳細情報:\n{final_text}\nありがとうございました。")
+            await query.message.reply_text(f"選択されました: {selected_rep2}\n詳細情報:\n{final_text}\nありがとうございました。")
 
     else:
         try:
@@ -315,6 +255,7 @@ async def main():
 
     # Thêm các handler
     application.add_handler(CommandHandler("start", start))
+    # MessageHandler chỉ còn nhiệm vụ chào mừng người dùng mới
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_press))
 
