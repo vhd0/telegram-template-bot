@@ -41,9 +41,10 @@ async def main():
 
     FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 
-    # Khởi tạo Telegram Application và liên kết rõ ràng với vòng lặp sự kiện hiện tại
-    # Điều này giúp đảm bảo Application sử dụng đúng vòng lặp sự kiện của Hypercorn
-    application = ApplicationBuilder().token(TOKEN).loop(asyncio.get_running_loop()).build()
+    # Khởi tạo Telegram Application. Loại bỏ .loop(asyncio.get_running_loop())
+    # vì ApplicationBuilder không có thuộc tính này và Application sẽ tự động
+    # liên kết với vòng lặp sự kiện đang chạy khi được build trong ngữ cảnh async.
+    application = ApplicationBuilder().token(TOKEN).build()
 
     # KHỞI TẠO ỨNG DỤNG TRƯỚC KHI XỬ LÝ CẬP NHẬT
     await application.initialize()
