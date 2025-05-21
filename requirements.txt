@@ -3,5 +3,5 @@ aiohttp
 python-dotenv
 pandas
 openpyxl
-Flask
-Hypercorn
+Flask[async]
+hypercorn
