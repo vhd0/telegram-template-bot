@@ -347,8 +347,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Flask Endpoints ---
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 async def telegram_webhook():
-    """Xử lý các cập nhật Telegram đến qua webhook."""
-    global application # Đảm bảo truy cập biến global application
+    global application
 
     if application is None:
         logger.error("Telegram Application object not initialized yet.")
@@ -362,23 +361,33 @@ async def telegram_webhook():
                 return "Bad Request", 400
 
             update = Update.de_json(json_data, application.bot)
-            
+
             # --- KHẮC PHỤC LỖI EVENT LOOP IS CLOSED ---
-            # Đảm bảo có một event loop đang hoạt động cho tác vụ này
+            # Đảm bảo có một event loop đang hoạt động.
+            # Cách này an toàn hơn để xử lý vòng lặp sự kiện
             try:
-                loop = asyncio.get_running_loop()
+                current_loop = asyncio.get_running_loop()
             except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+                current_loop = None
+
+            if not current_loop or current_loop.is_closed():
+                # Nếu không có loop nào hoặc loop đã đóng, tạo loop mới
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
                 logger.info("New event loop created and set for this request.")
-            
-            # Chạy process_update trong event loop hiện tại
-            await application.process_update(update)
+                # Chạy process_update trên loop mới
+                await new_loop.run_until_complete(application.process_update(update))
+            else:
+                # Nếu đã có loop đang chạy, dùng loop đó
+                await application.process_update(update)
+
             logger.info("Successfully processed Telegram update.")
             return "ok", 200
         except Exception as e:
             logger.error("Error processing Telegram update: %s", e)
-            return "ok", 200 # Trả về 200 OK để Telegram không gửi lại nhiều lần
+            # Đảm bảo rằng dù có lỗi, webhook vẫn trả về 200 OK
+            # để Telegram không liên tục gửi lại cập nhật
+            return "ok", 200 
     return "Method Not Allowed", 405
 
 @flask_app.route("/health", methods=["GET"])
