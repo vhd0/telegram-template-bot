@@ -357,6 +357,8 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Flask Endpoints ---
+# ... (giữ nguyên các phần khác) ...
+
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 async def telegram_webhook():
     """Xử lý các cập nhật Telegram đến qua webhook."""
@@ -375,20 +377,23 @@ async def telegram_webhook():
 
             update = Update.de_json(json_data, application.bot)
             
-            # --- ĐOẠN CODE ĐÃ SỬA: Xử lý bản cập nhật trong event loop HIỆN CÓ ---
-            # Xóa các dòng tạo loop mới và run_until_complete
-            # Sử dụng asyncio.create_task để lên lịch chạy coroutine
-            # Điều này cho phép Hypercorn duy trì quyền kiểm soát event loop chính
+            # --- ĐOẠN CODE ĐÃ SỬA: Chờ đợi process_update hoàn thành ---
+            # Trở lại cách chờ đợi trực tiếp process_update.
+            # Lý do: Trong môi trường Render, việc bắn tác vụ đi có thể khiến
+            # event loop bị đóng trước khi tác vụ kịp hoàn thành,
+            # hoặc nó gặp vấn đề với việc quản lý thread/context.
+            # Việc chờ đợi trực tiếp sẽ đảm bảo tác vụ hoàn thành trước khi response được gửi.
+            await application.process_update(update)
             
-            asyncio.create_task(application.process_update(update))
-            
-            logger.info("Đã lên lịch xử lý bản cập nhật Telegram thành công.")
+            logger.info("Đã xử lý bản cập nhật Telegram thành công.")
             return "ok", 200
         except Exception as e:
             logger.error("Lỗi khi xử lý bản cập nhật Telegram: %s", e)
             # Luôn trả về 200 OK để Telegram không gửi lại nhiều lần
             return "ok", 200 
     return "Phương thức không được phép", 405
+
+# ... (giữ nguyên các phần khác) ...
 
 @flask_app.route("/health", methods=["GET"])
 def health_check():
