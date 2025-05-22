@@ -1,7 +1,6 @@
-python-telegram-bot[webhooks]==20.6
-aiohttp
+python-telegram-bot==20.6
+Flask[async]
+hypercorn
 python-dotenv
 pandas
 openpyxl
-Flask[async]
-hypercorn
