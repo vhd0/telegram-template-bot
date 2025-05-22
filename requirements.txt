@@ -1,8 +1,9 @@
 python-telegram-bot==20.6
 Flask[async]
 hypercorn
-requests
-aiohttp   # Giữ nếu bạn vẫn cần cho mục đích khác, nếu không thì có thể xóa
+requests  # Đảm bảo requests có ở đây
+aiohttp   # Nếu không dùng thì xóa
 python-dotenv
 pandas
 openpyxl
+# Không có httpx ở đây, và cũng không có python-telegram-bot[webhooks]
