@@ -375,11 +375,21 @@ async def telegram_webhook():
 
             update = Update.de_json(json_data, application.bot)
             
-            # --- ĐOẠN CODE KHẮC PHỤC LỖI EVENT LOOP IS CLOSED ĐÃ BỊ LOẠI BỎ Ở ĐÂY ---
-            # Vì chúng ta chuyển sang HTTP backend đồng bộ (requests),
-            # đoạn code này không còn cần thiết và có thể gây ra vấn đề.
+            # --- ĐOẠN CODE KHẮC PHỤC LỖI EVENT LOOP IS CLOSED BẰNG CÁCH TẠO MỚI LOOP ---
+            # Đây là phương án mạnh mẽ hơn: luôn tạo một event loop mới và chạy tác vụ trên đó.
+            # Điều này giúp tránh việc sử dụng một loop đã bị đóng.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            logger.info("Đã tạo và đặt một event loop mới cho request này.")
             
-            await application.process_update(update)
+            # Chạy process_update trên event loop mới
+            await loop.run_until_complete(application.process_update(update))
+            
+            # Đóng event loop sau khi hoàn thành request.
+            # Điều này giúp giải phóng tài nguyên và tránh xung đột với các request khác.
+            loop.close()
+            logger.info("Event loop đã đóng sau khi xử lý request.")
+            
             logger.info("Đã xử lý bản cập nhật Telegram thành công.")
             return "ok", 200
         except Exception as e:
@@ -452,7 +462,6 @@ async def run_full_application():
 
 if __name__ == '__main__':
     try:
-        # Xóa asyncio.set_event_loop() khỏi đây vì chúng ta đang chuyển sang requests
         asyncio.run(run_full_application())
     except Exception as e:
         logger.critical("Ứng dụng đã dừng do lỗi không được xử lý: %s", e)
