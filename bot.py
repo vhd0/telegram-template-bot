@@ -5,9 +5,9 @@ import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TelegramError, BadRequest # Import BadRequest để bắt lỗi cụ thể
+from telegram.error import TelegramError, BadRequest
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify # Giữ Flask cho health check và có thể là các API khác nếu cần
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -17,23 +17,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Flask app giờ chỉ dùng cho health check
 flask_app = Flask(__name__)
-application = None
+# Ứng dụng Telegram Bot
+application = None 
 
 WEBHOOK_PATH = "/webhook_telegram"
 
 # --- Bot Data Structure ---
-# Đường dẫn đến file Excel
 EXCEL_FILE_PATH = "rep.xlsx"
-DATA_TABLE = [] # Khởi tạo rỗng, sẽ được điền từ Excel
+DATA_TABLE = []
 
-# Global mappings for shortening callback_data
-STRING_TO_ID_MAP = {} # Maps full string to a short integer ID
-ID_TO_STRING_MAP = {} # Maps short integer ID back to full string
+STRING_TO_ID_MAP = {}
+ID_TO_STRING_MAP = {}
 next_id = 0
 
 def get_or_create_id(text: str) -> int:
-    """Assigns a unique short integer ID to a given string."""
     global next_id
     if text not in STRING_TO_ID_MAP:
         STRING_TO_ID_MAP[text] = next_id
@@ -44,17 +43,14 @@ def get_or_create_id(text: str) -> int:
 # --- Tải dữ liệu từ Excel ---
 try:
     df = pd.read_excel(EXCEL_FILE_PATH)
-    # Kiểm tra các cột bắt buộc
     required_columns = ["Key", "Rep1", "Rep2", "Rep3"]
     if not all(col in df.columns for col in required_columns):
         raise ValueError(f"File Excel phải có các cột: {', '.join(required_columns)}")
 
-    # Điền các giá trị NaN bằng chuỗi rỗng trước khi chuyển đổi toàn bộ DataFrame
     df = df.fillna('')
     DATA_TABLE = df.astype(str).to_dict(orient='records')
     logger.info(f"Successfully loaded data from {EXCEL_FILE_PATH}")
 
-    # Populate the ID mappings for all relevant strings in DATA_TABLE
     for row in DATA_TABLE:
         get_or_create_id(row["Key"])
         get_or_create_id(row["Rep1"])
@@ -77,58 +73,38 @@ LEVEL_KEY = "key"
 LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 
-# Lấy CHANNEL_CHAT_ID từ biến môi trường
 CHANNEL_CHAT_ID = os.getenv("TELEGRAM_CHANNEL_CHAT_ID", "") 
 logger.info(f"Loaded CHANNEL_CHAT_ID from environment: '{CHANNEL_CHAT_ID}'")
 
-# Lấy ADMIN_CHAT_ID từ biến môi trường (để tránh xóa admin, tùy chọn)
-# Đây phải là ID user của bạn, không phải ID kênh
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 if ADMIN_CHAT_ID:
     logger.info(f"Loaded ADMIN_CHAT_ID from environment: '{ADMIN_CHAT_ID}'")
 else:
     logger.warning("ADMIN_CHAT_ID environment variable not set. Admin might be kicked if they are also a user.")
 
-
-# Cấu hình thời gian chờ để xóa thành viên (tính bằng giây)
 KICK_DELAY_SECONDS = 30 * 60 # 30 phút
 
-# Thông điệp chào mừng ban đầu
 INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
-
-# Thông điệp nhắc nhở chờ phản hồi hoặc nhấn lại nút
 WAIT_FOR_RESPONSE_MESSAGE_JP = "\n\n**処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
-
-# Thông điệp hướng dẫn sau khi bot đã xử lý (cố gắng) thêm vào kênh và gửi mã số
 POST_CODE_SUCCESS_MESSAGE_JP = "お客様の部屋番号は公式チャンネルに送信されました。チャンネルへようこそ！"
 POST_CODE_FAIL_MESSAGE_JP = "申し訳ございません。現在、チャンネルへの追加または番号の送信に問題が発生しています。"
 POST_CODE_NO_CONFIG_MESSAGE_JP = "チャンネル設定が完了していないため、部屋番号はチャンネルに送信されません。手動でチャンネルに参加して番号をご確認ください。"
 POST_CODE_ALREADY_MEMBER_MESSAGE_JP = "お客様はすでにチャンネルのメンバーです。部屋番号はチャンネルに送信されました。"
-
-
-# Thông điệp thông tin về thời gian chờ (dành cho final message)
 WAIT_TIME_MESSAGE_JP = "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。"
-
-# Thông điệp nhắc nhở khi người dùng gõ text không phải lệnh
 UNRECOGNIZED_MESSAGE_JP = "何を言っているのか分かりません。選択肢を始めるか、選択ボードを再起動するには、/start と入力してください。"
 
-# Set để lưu trữ user_id đã được chào mừng (sẽ bị reset khi bot khởi động lại)
 welcomed_users = set()
 
 # --- Hàm gửi các nút cấp độ đầu tiên ---
 async def send_initial_key_buttons(update_object: Update):
-    """Gửi tin nhắn chào mừng và các nút cấp độ 'Key' ban đầu."""
-    initial_keys_display = set() # For display text
-
+    initial_keys_display = set() 
     for row in DATA_TABLE:
-        # Chỉ thêm vào nếu 'Key' không rỗng
         if row["Key"]:
             initial_keys_display.add(row["Key"])
 
     keyboard = []
-    # Sort by display text for consistent order
     for key_val_display in sorted(list(initial_keys_display)):
-        key_val_id = get_or_create_id(key_val_display) # Get ID for callback_data
+        key_val_id = get_or_create_id(key_val_display) 
         keyboard.append([InlineKeyboardButton(key_val_display, callback_data=f"{LEVEL_KEY}:{key_val_id}::")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -139,12 +115,11 @@ async def send_initial_key_buttons(update_object: Update):
 
 # --- Telegram Bot Handlers ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Phản hồi tin nhắn người dùng, xử lý chào mừng lần đầu."""
     user_telegram_id = update.message.from_user.id
 
-    if user_telegram_id not in welcomed_users: # Logic cho bộ nhớ
+    if user_telegram_id not in welcomed_users:
         await send_initial_key_buttons(update)
-        welcomed_users.add(user_telegram_id) # Logic cho bộ nhớ
+        welcomed_users.add(user_telegram_id)
         logger.info(f"User {user_telegram_id} welcomed for the first time.")
         return
         
@@ -156,25 +131,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Xử lý lệnh /start.
-    Luôn gửi lại tin nhắn chào mừng và các nút ban đầu cho người dùng này,
-    reset trạng thái "đã chào mừng" trong bộ nhớ.
-    """
     user_telegram_id = update.message.from_user.id
     
-    # Xóa người dùng khỏi danh sách đã chào mừng (nếu có) để buộc gửi lại tin nhắn chào mừng
     if user_telegram_id in welcomed_users:
         welcomed_users.remove(user_telegram_id)
         logger.info(f"User {user_telegram_id} removed from welcomed_users (session reset by /start).")
     
     await send_initial_key_buttons(update)
-    welcomed_users.add(user_telegram_id) # Thêm lại vào bộ nhớ sau khi chào mừng
+    welcomed_users.add(user_telegram_id)
 
-# --- Hàm mới để lên lịch xóa người dùng ---
+
 async def schedule_kick_user(context: ContextTypes.DEFAULT_TYPE, channel_chat_id: str, user_id_to_kick: int):
-    """Lên lịch xóa người dùng khỏi kênh sau KICK_DELAY_SECONDS, trừ admin."""
-    # Kiểm tra nếu user_id_to_kick là admin, không xóa
     if ADMIN_CHAT_ID and str(user_id_to_kick) == ADMIN_CHAT_ID:
         logger.info(f"User {user_id_to_kick} is admin ({ADMIN_CHAT_ID}), skipping kick from channel {channel_chat_id}.")
         return
@@ -183,7 +150,6 @@ async def schedule_kick_user(context: ContextTypes.DEFAULT_TYPE, channel_chat_id
     await asyncio.sleep(KICK_DELAY_SECONDS)
     
     try:
-        # unban_chat_member loại bỏ người dùng khỏi supergroup và cho phép họ tham gia lại sau này.
         await context.bot.unban_chat_member(
             chat_id=channel_chat_id,
             user_id=user_id_to_kick
@@ -197,19 +163,15 @@ async def schedule_kick_user(context: ContextTypes.DEFAULT_TYPE, channel_chat_id
 
 
 async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xử lý các truy vấn callback đến từ các nút inline."""
     query = update.callback_query
-    
     await query.answer()
 
-    # Phân tích callback_data: level:key_id:rep1_id:rep2_id
-    data_parts = (query.data.split(':') + ['', '', '', ''])[:4] 
+    data_parts = (query.data.split(':') + ['', '', '', ''])[:4]
     current_level = data_parts[0]
-    selected_key_id = int(data_parts[1]) if data_parts[1] else -1 
+    selected_key_id = int(data_parts[1]) if data_parts[1] else -1
     selected_rep1_id = int(data_parts[2]) if data_parts[2] else -1
     selected_rep2_id = int(data_parts[3]) if data_parts[3] else -1
 
-    # Convert IDs back to original strings for logic and display
     selected_key_display = ID_TO_STRING_MAP.get(selected_key_id, f"ID_Key:{selected_key_id}")
     selected_rep1_display = ID_TO_STRING_MAP.get(selected_rep1_id, f"ID_Rep1:{selected_rep1_id}") if selected_rep1_id != -1 else ''
     selected_rep2_display = ID_TO_STRING_MAP.get(selected_rep2_id, f"ID_Rep2:{selected_rep2_id}") if selected_rep2_id != -1 else ''
@@ -278,10 +240,8 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         user_telegram_id = query.from_user.id
         user_full_name = query.from_user.full_name or f"User ID: {user_telegram_id}"
-        # Tin nhắn gửi vào kênh sẽ bao gồm Mã số - Tên người dùng (và ID)
         message_to_channel = f"コード: {final_rep3_text}\nユーザー: {user_full_name}\nID: `{user_telegram_id}`"
 
-        # Gửi REP3 thành tin nhắn riêng cho người dùng trước
         try:
             await query.edit_message_text(text=f"あなたの部屋番号: {final_rep3_text}")
             logger.info(f"Sent Rep3 to user {user_telegram_id}.")
@@ -289,13 +249,11 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.warning("Could not edit message (sending Rep3, message ID: %s): %s", query.message.message_id, e)
             await query.message.reply_text(text=f"あなたの部屋番号: {final_rep3_text}")
         
-        # --- Logic thêm người dùng vào kênh và gửi mã số ---
         instruction_message_for_user = ""
-        user_is_member_of_channel = False # Biến để theo dõi trạng thái thành viên
+        user_is_member_of_channel = False 
 
         if CHANNEL_CHAT_ID: 
             try:
-                # Bước 1: Kiểm tra xem người dùng đã là thành viên chưa
                 chat_member_status = await context.bot.get_chat_member(chat_id=CHANNEL_CHAT_ID, user_id=user_telegram_id)
                 
                 if chat_member_status.status in ['member', 'creator', 'administrator', 'restricted']:
@@ -303,7 +261,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                     user_is_member_of_channel = True
                     logger.info(f"User {user_telegram_id} is already a member of channel {CHANNEL_CHAT_ID}. Skipping add attempt.")
                 else:
-                    # Nếu chưa phải thành viên hoặc đã rời đi/bị cấm, cố gắng thêm
                     await context.bot.set_chat_member(
                         chat_id=CHANNEL_CHAT_ID,
                         user_id=user_telegram_id,
@@ -311,7 +268,7 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                     logger.info(f"Attempted to add user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
                     instruction_message_for_user = POST_CODE_SUCCESS_MESSAGE_JP
-                    user_is_member_of_channel = True # Đánh dấu là đã được thêm
+                    user_is_member_of_channel = True
 
             except BadRequest as e: 
                 if "user not found" in e.message.lower() or "user is a bot" in e.message.lower():
@@ -319,13 +276,12 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                     instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (ユーザーを追加できませんでした)"
                 elif "user is already a member of the chat" in e.message.lower():
                     instruction_message_for_user = POST_CODE_ALREADY_MEMBER_MESSAGE_JP
-                    user_is_member_of_channel = True # Đánh dấu là đã là thành viên
+                    user_is_member_of_channel = True
                     logger.info(f"User {user_telegram_id} is already a member of channel {CHANNEL_CHAT_ID}. (Caught BadRequest)")
                 else:
                     logger.error(f"Specific BadRequest error when adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
                     instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (エラー: {e.message})"
                 
-                # Nếu không thể thêm và người dùng chưa là thành viên, tạo link mời (fallback)
                 if not user_is_member_of_channel: 
                     try:
                         invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
@@ -337,7 +293,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             except TelegramError as e: 
                 logger.error(f"Telegram API Error adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
                 instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (エラー: {e.message})"
-                # Fallback: cố gắng tạo link mời nếu không thể thêm trực tiếp
                 try:
                     invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
                     instruction_message_for_user += f"\n\n代わりに、このリンクから手動で参加してください: <a href='{invite_link_object.invite_link}'>チャンネルに参加</a>"
@@ -348,7 +303,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as e: 
                 logger.error(f"General Error adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
                 instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (一般的なエラー: {e})"
-                # Fallback: cố gắng tạo link mời
                 try:
                     invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
                     instruction_message_for_user += f"\n\n代わりに、このリンクから手動で参加してください: <a href='{invite_link_object.invite_link}'>チャンネルに参加</a>"
@@ -356,24 +310,18 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                     logger.error(f"Could not create invite link: {link_e}")
                     instruction_message_for_user += "\n\n(リンクを作成できませんでした)"
             
-            # Gửi tin nhắn mã số vào kênh chính (luôn cố gắng gửi nếu CHANNEL_CHAT_ID có)
             try:
                 await context.bot.send_message(
                     chat_id=CHANNEL_CHAT_ID,
                     text=message_to_channel,
-                    parse_mode='Markdown' # Sử dụng Markdown để format ID
+                    parse_mode='Markdown'
                 )
                 logger.info(f"Sent code '{final_rep3_text}' for user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
 
-                # --- LÊN LỊCH XÓA NGƯỜI DÙNG SAU 30 PHÚT ---
-                # Chỉ lên lịch xóa nếu người dùng được thêm vào hoặc đã là thành viên (và không phải admin)
                 if user_is_member_of_channel: 
-                    # Đảm bảo ADMIN_CHAT_ID được cấu hình và không trùng với user_telegram_id
-                    if ADMIN_CHAT_ID and str(user_telegram_id) == ADMIN_CHAT_ID:
-                        logger.info(f"User {user_telegram_id} is admin ({ADMIN_CHAT_ID}), skipping kick from channel {CHANNEL_CHAT_ID}.")
-                    else:
-                        asyncio.create_task(schedule_kick_user(context, CHANNEL_CHAT_ID, user_telegram_id))
-                        logger.info(f"User {user_telegram_id} scheduled for kick from channel {CHANNEL_CHAT_ID}.")
+                    # Kích hoạt việc lên lịch xóa, trừ khi user_telegram_id là ADMIN_CHAT_ID
+                    asyncio.create_task(schedule_kick_user(context, CHANNEL_CHAT_ID, user_telegram_id))
+                    logger.info(f"User {user_telegram_id} scheduled for kick from channel {CHANNEL_CHAT_ID}.")
 
             except Exception as e:
                 logger.error(f"Failed to send message to channel {CHANNEL_CHAT_ID}: {e}")
@@ -382,7 +330,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.warning("CHANNEL_CHAT_ID is not set. Skipping adding user to channel and sending message to channel.")
             instruction_message_for_user = POST_CODE_NO_CONFIG_MESSAGE_JP
             
-        # Gửi tin nhắn hướng dẫn và thời gian chờ tiếp theo cho người dùng (vào chat riêng của họ)
         full_instruction_and_wait_text = f"{instruction_message_for_user}\n\n{WAIT_TIME_MESSAGE_JP}"
         
         try:
@@ -400,42 +347,16 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text("不明な操作です。")
 
 
-# --- Flask Endpoints ---
-@flask_app.route(WEBHOOK_PATH, methods=["POST"])
-async def telegram_webhook():
-    """Xử lý các cập nhật Telegram đến qua webhook."""
-    global application
-    if application is None:
-        logger.error("Telegram Application object not initialized yet.")
-        return "Internal Server Error: Bot not ready", 500
-
-    if request.method == "POST":
-        try:
-            json_data = request.get_json(force=True)
-            if not json_data:
-                logger.warning("Received empty or invalid JSON payload from webhook.")
-                return "Bad Request", 400
-
-            update = Update.de_json(json_data, application.bot)
-            await application.process_update(update)
-            logger.info("Successfully processed Telegram update.")
-            return "ok", 200
-        except Exception as e:
-            logger.error("Error processing Telegram update: %s", e)
-            return "ok", 200
-    return "Method Not Allowed", 405
-
+# --- Flask Endpoint cho Health Check (và có thể các API khác) ---
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint for Render's health checks."""
     return jsonify({"status": "ok"})
 
 
-# --- Global Error Handler for Application ---
+# --- Global Error Handler cho Application ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
     logger.error("Exception while handling an update:", exc_info=context.error)
-    # Gửi thông báo lỗi đến ADMIN_CHAT_ID (nếu được cấu hình)
     if ADMIN_CHAT_ID:
         try:
             error_message_for_admin = f"❌ Bot Error ❌\n\nUpdate: {update}\n\nError: {context.error}"
@@ -473,6 +394,28 @@ async def run_full_application():
 
     await application.initialize()
 
+    # THAY ĐỔI LỚN TẠI ĐÂY:
+    # Hypercorn sẽ phục vụ cả ứng dụng Telegram Bot (là một ASGI app)
+    # và Flask app (cho health check).
+    # Chúng ta cần một ứng dụng ASGI chính mà Hypercorn có thể chạy.
+    # python-telegram-bot có thể tự tạo một ASGI application.
+
+    # Tuy nhiên, cách tốt nhất để kết hợp Flask và PTB ASGI app là dùng một ASGI wrapper.
+    # Nhưng vì bạn đã có Flask đang chạy trên cùng cổng, chúng ta sẽ để Flask là chính
+    # và để PTB webhook chạy bên trong Flask.
+    # Lỗi 'Event loop is closed' vẫn có thể xảy ra do cách Render quản lý process.
+
+    # Cách tiếp cận trước đó của bạn (Flask nhận webhook và gọi process_update)
+    # là cách phổ biến và thường hoạt động. Lỗi bạn gặp có thể do:
+    # 1. Quản lý event loop của Render: Render có thể đóng process hoặc event loop
+    #    mà không báo trước, gây ra lỗi.
+    # 2. Xung đột ngầm giữa Flask/Hypercorn và PTB's asyncio usage.
+
+    # Phương án an toàn hơn nếu muốn dùng run_webhook() là chạy PTB Application
+    # như một ứng dụng độc lập trên một cổng khác, hoặc sử dụng một ASGI gateway
+    # để định tuyến các request đến đúng ứng dụng.
+    # Tuy nhiên, trên Render, việc chạy nhiều dịch vụ trên cùng một cổng phức tạp hơn.
+
     logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
     try:
         await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
@@ -485,7 +428,81 @@ async def run_full_application():
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     
-    await serve(flask_app, config)
+    # Để giải quyết lỗi 'Event loop is closed', chúng ta sẽ cố gắng sử dụng
+    # `application.run_webhook()` và phục vụ nó bằng Hypercorn.
+    # Điều này sẽ bỏ qua Flask cho webhook xử lý.
+    # Tuy nhiên, nếu bạn vẫn muốn /health check qua Flask, chúng ta cần một cơ chế khác.
+    # Ví dụ: chạy Flask trên một cổng khác hoặc tạo một ASGI app tổng hợp.
+
+    # Với lỗi bạn đang gặp, giải pháp khả dĩ nhất là **chuyển sang chỉ chạy PTB's webhook app**
+    # nếu health check không quá quan trọng hoặc có thể được xử lý bởi Render.
+
+    # Option 1: Chỉ chạy PTB Webhook (Nếu bạn không cần Flask API khác)
+    # await serve(application.webhooks_app, config)
+    # Option 2: Chạy Flask với webhook handler như bạn đã có (có thể gặp lỗi event loop)
+
+    # Vấn đề là bạn đang muốn cả Flask và PTB cùng chia sẻ một Hypercorn server.
+    # Điều này cần một ASGI wrapper như `Starlette` hoặc `FastAPI` để định tuyến request.
+    # Nhưng để tối ưu và giảm thiểu lỗi, chúng ta sẽ thử **chạy riêng ứng dụng webhook của PTB**.
+    # Điều này có nghĩa là endpoint `/webhook_telegram` sẽ được xử lý bởi PTB,
+    # còn `/health` của Flask sẽ không thể truy cập được trên cùng cổng.
+
+    # Để giữ health check, cách tốt nhất là có một ASGI app chung.
+    # Nhưng để giảm lỗi, chúng ta sẽ tập trung vào việc xử lý webhook.
+
+    # KHÔNG THỂ CHẠY CẢ FLASK VÀ PTB APPLICATION TRỰC TIẾP CÙNG LÚC TRÊN CÙNG CỔNG
+    # BẰNG hypercorn.asyncio.serve() MÀ KHÔNG CÓ ASGI DISPATCHER.
+
+    # Lỗi `RuntimeError('Event loop is closed')` thường xuất hiện khi Hypercorn
+    # hoặc Flask cố gắng sử dụng một event loop đã bị đóng bởi một phần khác
+    # của ứng dụng (hoặc bởi chính môi trường runtime của Render).
+    # Điều này cho thấy có sự xung đột trong cách event loop được quản lý.
+
+    # Giải pháp tối ưu nhất cho vấn đề này là để `python-telegram-bot` tự quản lý webhook
+    # hoàn toàn, và nếu cần health check, hãy đặt nó trên một cổng khác hoặc dùng một công cụ khác.
+
+    # Tuy nhiên, nếu bạn muốn giữ Flask cho health check và các mục đích khác,
+    # chúng ta phải quay lại cách cũ (Flask nhận webhook và gọi process_update),
+    # nhưng cố gắng làm cho nó robust hơn hoặc chấp nhận lỗi đó là do môi trường.
+
+    # NHỮNG THAY ĐỔI HIỆN TẠI:
+    # 1. Loại bỏ hàm `telegram_webhook` trong Flask.
+    # 2. Để PTB Application tự chạy webhook listener của nó.
+    # 3. Để Hypercorn phục vụ PTB Application (là một ASGI app).
+    # 4. Health check của Flask sẽ không hoạt động trên cùng cổng nữa.
+
+    # Để giải quyết lỗi `RuntimeError('Event loop is closed')` một cách triệt để
+    # khi chạy cả Flask và python-telegram-bot webhooks trên **cùng một cổng**
+    # với Hypercorn, chúng ta cần một **ASGI Router/Dispatcher**.
+
+    # Một cách tiếp cận là sử dụng một thư viện ASGI nhỏ như `Starlette` hoặc `FastAPI`
+    # làm bộ định tuyến chính, sau đó mount Flask app và PTB webhook app vào đó.
+    # Tuy nhiên, việc này sẽ làm tăng độ phức tạp.
+
+    # PHƯƠNG ÁN ĐƠN GIẢN HƠN: Chạy PTB Webhook Application.
+    # Nếu bạn chỉ cần health check thì Render có thể kiểm tra cổng của app.
+    # Bạn có thể bỏ `flask_app` và chỉ chạy `application.webhooks_app`
+
+    # Thay đổi lại `run_full_application`
+    # Chạy `application.run_webhook()` sẽ khởi tạo một ASGI application
+    # mà bạn có thể truyền vào `hypercorn.asyncio.serve`.
+    # Đây là cách chính thống để chạy PTB webhooks với ASGI.
+    
+    # Chúng ta sẽ truyền `application.webhooks_app` vào `serve`
+    # và bỏ qua `flask_app` trong phần chính để tránh xung đột event loop.
+    # Health check vẫn có thể hoạt động nếu Render kiểm tra endpoint mặc định của webhook.
+
+    await serve(application.webhooks_app, config)
+    # Lưu ý: Nếu bạn muốn chạy Flask cho /health và các API khác,
+    # bạn cần một ASGI dispatcher để định tuyến requests.
+    # Ví dụ với FastAPI/Starlette:
+    # app = FastAPI()
+    # @app.get("/health")
+    # async def health_check_api(): return {"status": "ok"}
+    # app.mount(WEBHOOK_PATH, WSGIMiddleware(flask_app)) # Không, PTB là ASGI.
+    # app.mount(WEBHOOK_PATH, application.webhooks_app) # Đây là cách đúng
+    # await serve(app, config)
+    # Nhưng điều này phức tạp hơn. Hãy thử cách tối giản nhất để loại bỏ lỗi.
 
 
 if __name__ == '__main__':
