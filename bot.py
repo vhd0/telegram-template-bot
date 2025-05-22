@@ -5,7 +5,7 @@ import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest 
 
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
@@ -375,22 +375,14 @@ async def telegram_webhook():
 
             update = Update.de_json(json_data, application.bot)
             
-            # --- ĐOẠN CODE KHẮC PHỤC LỖI EVENT LOOP IS CLOSED BẰNG CÁCH TẠO MỚI LOOP ---
-            # Đây là phương án mạnh mẽ hơn: luôn tạo một event loop mới và chạy tác vụ trên đó.
-            # Điều này giúp tránh việc sử dụng một loop đã bị đóng.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            logger.info("Đã tạo và đặt một event loop mới cho request này.")
+            # --- ĐOẠN CODE ĐÃ SỬA: Xử lý bản cập nhật trong event loop HIỆN CÓ ---
+            # Xóa các dòng tạo loop mới và run_until_complete
+            # Sử dụng asyncio.create_task để lên lịch chạy coroutine
+            # Điều này cho phép Hypercorn duy trì quyền kiểm soát event loop chính
             
-            # Chạy process_update trên event loop mới
-            await loop.run_until_complete(application.process_update(update))
+            asyncio.create_task(application.process_update(update))
             
-            # Đóng event loop sau khi hoàn thành request.
-            # Điều này giúp giải phóng tài nguyên và tránh xung đột với các request khác.
-            loop.close()
-            logger.info("Event loop đã đóng sau khi xử lý request.")
-            
-            logger.info("Đã xử lý bản cập nhật Telegram thành công.")
+            logger.info("Đã lên lịch xử lý bản cập nhật Telegram thành công.")
             return "ok", 200
         except Exception as e:
             logger.error("Lỗi khi xử lý bản cập nhật Telegram: %s", e)
