@@ -5,7 +5,7 @@ import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TelegramError # Import để bắt lỗi cụ thể của Telegram
+from telegram.error import TelegramError, BadRequest # Import BadRequest để bắt lỗi cụ thể
 
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
@@ -50,7 +50,6 @@ try:
         raise ValueError(f"File Excel phải có các cột: {', '.join(required_columns)}")
 
     # Điền các giá trị NaN bằng chuỗi rỗng trước khi chuyển đổi toàn bộ DataFrame
-    # Điều này khắc phục lỗi 'nan' khi đọc từ các ô trống trong Excel.
     df = df.fillna('')
     DATA_TABLE = df.astype(str).to_dict(orient='records')
     logger.info(f"Successfully loaded data from {EXCEL_FILE_PATH}")
@@ -60,7 +59,6 @@ try:
         get_or_create_id(row["Key"])
         get_or_create_id(row["Rep1"])
         get_or_create_id(row["Rep2"])
-        # Rep3 thường là text cuối cùng, không cần nút cho nó nên không cần tạo ID
     logger.info("String to ID mappings created successfully.")
 
 except FileNotFoundError:
@@ -79,8 +77,21 @@ LEVEL_KEY = "key"
 LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 
-# CHỈ LẤY CHANNEL_CHAT_ID TỪ BIẾN MÔI TRƯỜNG
-CHANNEL_CHAT_ID = os.getenv("TELEGRAM_CHANNEL_CHAT_ID", "") # Mặc định là chuỗi rỗng nếu không tìm thấy
+# Lấy CHANNEL_CHAT_ID từ biến môi trường
+CHANNEL_CHAT_ID = os.getenv("TELEGRAM_CHANNEL_CHAT_ID", "") 
+logger.info(f"Loaded CHANNEL_CHAT_ID from environment: '{CHANNEL_CHAT_ID}'")
+
+# Lấy ADMIN_CHAT_ID từ biến môi trường (để tránh xóa admin, tùy chọn)
+# Đây phải là ID user của bạn, không phải ID kênh
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+if ADMIN_CHAT_ID:
+    logger.info(f"Loaded ADMIN_CHAT_ID from environment: '{ADMIN_CHAT_ID}'")
+else:
+    logger.warning("ADMIN_CHAT_ID environment variable not set. Admin might be kicked if they are also a user.")
+
+
+# Cấu hình thời gian chờ để xóa thành viên (tính bằng giây)
+KICK_DELAY_SECONDS = 30 * 60 # 30 phút
 
 # Thông điệp chào mừng ban đầu
 INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
@@ -89,9 +100,10 @@ INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選�
 WAIT_FOR_RESPONSE_MESSAGE_JP = "\n\n**処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
 
 # Thông điệp hướng dẫn sau khi bot đã xử lý (cố gắng) thêm vào kênh và gửi mã số
-POST_CODE_SUCCESS_MESSAGE_JP = "お客様の番号は公式チャンネルに送信され、チャンネルへの追加が試行されました。ご確認ください。"
-POST_CODE_FAIL_MESSAGE_JP = "申し訳ございません。チャンネルへの追加または番号の送信に問題が発生しました。手動でチャンネルに参加して、番号をご確認ください。" # Thêm chỗ này nếu cần link kênh trực tiếp
-POST_CODE_NO_CONFIG_MESSAGE_JP = "チャンネルへの自動追加が設定されていないため、番号はチャンネルに送信されません。手動でチャンネルに参加して番号をご確認ください。"
+POST_CODE_SUCCESS_MESSAGE_JP = "お客様の部屋番号は公式チャンネルに送信されました。チャンネルへようこそ！"
+POST_CODE_FAIL_MESSAGE_JP = "申し訳ございません。現在、チャンネルへの追加または番号の送信に問題が発生しています。"
+POST_CODE_NO_CONFIG_MESSAGE_JP = "チャンネル設定が完了していないため、部屋番号はチャンネルに送信されません。手動でチャンネルに参加して番号をご確認ください。"
+POST_CODE_ALREADY_MEMBER_MESSAGE_JP = "お客様はすでにチャンネルのメンバーです。部屋番号はチャンネルに送信されました。"
 
 
 # Thông điệp thông tin về thời gian chờ (dành cho final message)
@@ -122,7 +134,6 @@ async def send_initial_key_buttons(update_object: Update):
 
     user_telegram_id = update_object.message.from_user.id
     logger.info(f"Sending initial welcome message to user ID: {user_telegram_id}")
-    # Sử dụng parse_mode='Markdown' để bold đoạn văn bản
     await update_object.message.reply_text(INITIAL_WELCOME_MESSAGE_JP, reply_markup=reply_markup, parse_mode='Markdown')
 
 
@@ -160,6 +171,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_initial_key_buttons(update)
     welcomed_users.add(user_telegram_id) # Thêm lại vào bộ nhớ sau khi chào mừng
 
+# --- Hàm mới để lên lịch xóa người dùng ---
+async def schedule_kick_user(context: ContextTypes.DEFAULT_TYPE, channel_chat_id: str, user_id_to_kick: int):
+    """Lên lịch xóa người dùng khỏi kênh sau KICK_DELAY_SECONDS, trừ admin."""
+    # Kiểm tra nếu user_id_to_kick là admin, không xóa
+    if ADMIN_CHAT_ID and str(user_id_to_kick) == ADMIN_CHAT_ID:
+        logger.info(f"User {user_id_to_kick} is admin ({ADMIN_CHAT_ID}), skipping kick from channel {channel_chat_id}.")
+        return
+
+    logger.info(f"Scheduling kick for user {user_id_to_kick} from channel {channel_chat_id} in {KICK_DELAY_SECONDS} seconds.")
+    await asyncio.sleep(KICK_DELAY_SECONDS)
+    
+    try:
+        # unban_chat_member loại bỏ người dùng khỏi supergroup và cho phép họ tham gia lại sau này.
+        await context.bot.unban_chat_member(
+            chat_id=channel_chat_id,
+            user_id=user_id_to_kick
+        )
+        logger.info(f"Successfully kicked user {user_id_to_kick} from channel {channel_chat_id}.")
+        
+    except TelegramError as e:
+        logger.error(f"Telegram API Error kicking user {user_id_to_kick} from channel {channel_chat_id}: {e}")
+    except Exception as e:
+        logger.error(f"General Error kicking user {user_id_to_kick} from channel {channel_chat_id}: {e}")
+
 
 async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý các truy vấn callback đến từ các nút inline."""
@@ -168,15 +203,13 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     # Phân tích callback_data: level:key_id:rep1_id:rep2_id
-    # Đảm bảo các phần tử đủ số lượng, nếu không có thì gán mặc định là rỗng
-    data_parts = (query.data.split(':') + ['', '', '', ''])[:4] # Đảm bảo luôn có 4 phần tử
+    data_parts = (query.data.split(':') + ['', '', '', ''])[:4] 
     current_level = data_parts[0]
-    selected_key_id = int(data_parts[1]) if data_parts[1] else -1 # Sử dụng -1 hoặc giá trị không hợp lệ
+    selected_key_id = int(data_parts[1]) if data_parts[1] else -1 
     selected_rep1_id = int(data_parts[2]) if data_parts[2] else -1
     selected_rep2_id = int(data_parts[3]) if data_parts[3] else -1
 
     # Convert IDs back to original strings for logic and display
-    # Sử dụng .get() an toàn hơn để tránh KeyError nếu ID không tồn tại
     selected_key_display = ID_TO_STRING_MAP.get(selected_key_id, f"ID_Key:{selected_key_id}")
     selected_rep1_display = ID_TO_STRING_MAP.get(selected_rep1_id, f"ID_Rep1:{selected_rep1_id}") if selected_rep1_id != -1 else ''
     selected_rep2_display = ID_TO_STRING_MAP.get(selected_rep2_id, f"ID_Rep2:{selected_rep2_id}") if selected_rep2_id != -1 else ''
@@ -186,7 +219,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     if current_level == LEVEL_KEY:
         next_rep1_values_display = set()
         for row in DATA_TABLE:
-            # So sánh với ID của Key đã chọn và đảm bảo Rep1 không rỗng
             if get_or_create_id(row["Key"]) == selected_key_id and row["Rep1"]:
                 next_rep1_values_display.add(row["Rep1"])
         
@@ -198,7 +230,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             try:
-                # Thêm thông báo chờ vào đây
                 await query.edit_message_text(text=f"選択されました: {selected_key_display}\n次に進んでください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
             except Exception as e:
                 logger.warning("Could not edit message for REP1 (message ID: %s): %s", query.message.message_id, e)
@@ -213,7 +244,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif current_level == LEVEL_REP1:
         next_rep2_values_display = set()
         for row in DATA_TABLE:
-            # So sánh với ID của Key và Rep1 đã chọn và đảm bảo Rep2 không rỗng
             if get_or_create_id(row["Key"]) == selected_key_id and \
                get_or_create_id(row["Rep1"]) == selected_rep1_id and row["Rep2"]:
                 next_rep2_values_display.add(row["Rep2"])
@@ -226,7 +256,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
-                # Thêm thông báo chờ vào đây
                 await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n次に進んでください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
             except Exception as e:
                 logger.warning("Could not edit message for REP2 (message ID: %s): %s", query.message.message_id, e)
@@ -241,7 +270,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif current_level == LEVEL_REP2:
         final_rep3_text = "情報が見つかりません。"
         for row in DATA_TABLE:
-            # So sánh với ID của Key, Rep1, Rep2 đã chọn
             if get_or_create_id(row["Key"]) == selected_key_id and \
                get_or_create_id(row["Rep1"]) == selected_rep1_id and \
                get_or_create_id(row["Rep2"]) == selected_rep2_id:
@@ -250,55 +278,106 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         user_telegram_id = query.from_user.id
         user_full_name = query.from_user.full_name or f"User ID: {user_telegram_id}"
-        message_to_channel = f"{final_rep3_text} - {user_full_name}"
+        # Tin nhắn gửi vào kênh sẽ bao gồm Mã số - Tên người dùng (và ID)
+        message_to_channel = f"コード: {final_rep3_text}\nユーザー: {user_full_name}\nID: `{user_telegram_id}`"
 
         # Gửi REP3 thành tin nhắn riêng cho người dùng trước
         try:
-            await query.edit_message_text(text=f"あなたの番号: {final_rep3_text}")
+            await query.edit_message_text(text=f"あなたの部屋番号: {final_rep3_text}")
             logger.info(f"Sent Rep3 to user {user_telegram_id}.")
         except Exception as e:
             logger.warning("Could not edit message (sending Rep3, message ID: %s): %s", query.message.message_id, e)
-            await query.message.reply_text(text=f"あなたの番号: {final_rep3_text}")
+            await query.message.reply_text(text=f"あなたの部屋番号: {final_rep3_text}")
         
         # --- Logic thêm người dùng vào kênh và gửi mã số ---
         instruction_message_for_user = ""
+        user_is_member_of_channel = False # Biến để theo dõi trạng thái thành viên
 
-        if CHANNEL_CHAT_ID: # Chỉ thực hiện nếu CHANNEL_CHAT_ID được thiết lập
+        if CHANNEL_CHAT_ID: 
             try:
-                # Cố gắng thêm thành viên. Lưu ý: Chỉ hoạt động nếu kênh là Supergroup
-                # và bot là admin với quyền "Invite Users" (can_invite_users=True)
-                # và người dùng đã chat với bot trước đó.
-                # set_chat_member status='member' là cách để thêm thành viên mới nhất
-                await context.bot.set_chat_member(
-                    chat_id=CHANNEL_CHAT_ID,
-                    user_id=user_telegram_id,
-                    status='member' # Đặt trạng thái là 'member' để thêm vào
-                )
-                logger.info(f"Attempted to add user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
+                # Bước 1: Kiểm tra xem người dùng đã là thành viên chưa
+                chat_member_status = await context.bot.get_chat_member(chat_id=CHANNEL_CHAT_ID, user_id=user_telegram_id)
                 
-                # Gửi tin nhắn mã số vào kênh
-                await context.bot.send_message(
-                    chat_id=CHANNEL_CHAT_ID,
-                    text=message_to_channel
-                )
-                logger.info(f"Sent code '{final_rep3_text}' for user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
-                instruction_message_for_user = POST_CODE_SUCCESS_MESSAGE_JP
+                if chat_member_status.status in ['member', 'creator', 'administrator', 'restricted']:
+                    instruction_message_for_user = POST_CODE_ALREADY_MEMBER_MESSAGE_JP
+                    user_is_member_of_channel = True
+                    logger.info(f"User {user_telegram_id} is already a member of channel {CHANNEL_CHAT_ID}. Skipping add attempt.")
+                else:
+                    # Nếu chưa phải thành viên hoặc đã rời đi/bị cấm, cố gắng thêm
+                    await context.bot.set_chat_member(
+                        chat_id=CHANNEL_CHAT_ID,
+                        user_id=user_telegram_id,
+                        status='member'
+                    )
+                    logger.info(f"Attempted to add user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
+                    instruction_message_for_user = POST_CODE_SUCCESS_MESSAGE_JP
+                    user_is_member_of_channel = True # Đánh dấu là đã được thêm
 
-            except TelegramError as e:
-                logger.error(f"Telegram API Error adding user {user_telegram_id} or sending message to channel {CHANNEL_CHAT_ID}: {e}")
-                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (Lỗi: {e.message})"
-                # Nếu bot không thể thêm, có thể tạo link mời và gửi cho người dùng
+            except BadRequest as e: 
+                if "user not found" in e.message.lower() or "user is a bot" in e.message.lower():
+                    logger.warning(f"BadRequest when adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e.message}")
+                    instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (ユーザーを追加できませんでした)"
+                elif "user is already a member of the chat" in e.message.lower():
+                    instruction_message_for_user = POST_CODE_ALREADY_MEMBER_MESSAGE_JP
+                    user_is_member_of_channel = True # Đánh dấu là đã là thành viên
+                    logger.info(f"User {user_telegram_id} is already a member of channel {CHANNEL_CHAT_ID}. (Caught BadRequest)")
+                else:
+                    logger.error(f"Specific BadRequest error when adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
+                    instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (エラー: {e.message})"
+                
+                # Nếu không thể thêm và người dùng chưa là thành viên, tạo link mời (fallback)
+                if not user_is_member_of_channel: 
+                    try:
+                        invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
+                        instruction_message_for_user += f"\n\n代わりに、このリンクから手動で参加してください: <a href='{invite_link_object.invite_link}'>チャンネルに参加</a>"
+                    except Exception as link_e:
+                        logger.error(f"Could not create invite link: {link_e}")
+                        instruction_message_for_user += "\n\n(リンクを作成できませんでした)"
+
+            except TelegramError as e: 
+                logger.error(f"Telegram API Error adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
+                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (エラー: {e.message})"
+                # Fallback: cố gắng tạo link mời nếu không thể thêm trực tiếp
                 try:
-                    # Tạo link mời có giới hạn 1 thành viên để chỉ dùng 1 lần
-                    invite_link = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
-                    instruction_message_for_user += f"\n\nまたは、このリンクから手動で参加してください: <a href='{invite_link.invite_link}'>チャンネルに参加</a>"
+                    invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
+                    instruction_message_for_user += f"\n\n代わりに、このリンクから手動で参加してください: <a href='{invite_link_object.invite_link}'>チャンネルに参加</a>"
                 except Exception as link_e:
                     logger.error(f"Could not create invite link: {link_e}")
                     instruction_message_for_user += "\n\n(リンクを作成できませんでした)"
 
+            except Exception as e: 
+                logger.error(f"General Error adding user {user_telegram_id} to channel {CHANNEL_CHAT_ID}: {e}")
+                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (一般的なエラー: {e})"
+                # Fallback: cố gắng tạo link mời
+                try:
+                    invite_link_object = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
+                    instruction_message_for_user += f"\n\n代わりに、このリンクから手動で参加してください: <a href='{invite_link_object.invite_link}'>チャンネルに参加</a>"
+                except Exception as link_e:
+                    logger.error(f"Could not create invite link: {link_e}")
+                    instruction_message_for_user += "\n\n(リンクを作成できませんでした)"
+            
+            # Gửi tin nhắn mã số vào kênh chính (luôn cố gắng gửi nếu CHANNEL_CHAT_ID có)
+            try:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_CHAT_ID,
+                    text=message_to_channel,
+                    parse_mode='Markdown' # Sử dụng Markdown để format ID
+                )
+                logger.info(f"Sent code '{final_rep3_text}' for user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
+
+                # --- LÊN LỊCH XÓA NGƯỜI DÙNG SAU 30 PHÚT ---
+                # Chỉ lên lịch xóa nếu người dùng được thêm vào hoặc đã là thành viên (và không phải admin)
+                if user_is_member_of_channel: 
+                    # Đảm bảo ADMIN_CHAT_ID được cấu hình và không trùng với user_telegram_id
+                    if ADMIN_CHAT_ID and str(user_telegram_id) == ADMIN_CHAT_ID:
+                        logger.info(f"User {user_telegram_id} is admin ({ADMIN_CHAT_ID}), skipping kick from channel {CHANNEL_CHAT_ID}.")
+                    else:
+                        asyncio.create_task(schedule_kick_user(context, CHANNEL_CHAT_ID, user_telegram_id))
+                        logger.info(f"User {user_telegram_id} scheduled for kick from channel {CHANNEL_CHAT_ID}.")
+
             except Exception as e:
-                logger.error(f"General Error adding user {user_telegram_id} or sending message to channel {CHANNEL_CHAT_ID}: {e}")
-                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (Lỗi chung: {e})"
+                logger.error(f"Failed to send message to channel {CHANNEL_CHAT_ID}: {e}")
+                instruction_message_for_user += "\n\n(チャンネルに番号を送信できませんでした。)"
         else:
             logger.warning("CHANNEL_CHAT_ID is not set. Skipping adding user to channel and sending message to channel.")
             instruction_message_for_user = POST_CODE_NO_CONFIG_MESSAGE_JP
@@ -307,7 +386,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
         full_instruction_and_wait_text = f"{instruction_message_for_user}\n\n{WAIT_TIME_MESSAGE_JP}"
         
         try:
-            # Sử dụng parse_mode='HTML' nếu bạn có thể có link mời trong instruction_message_for_user
             await query.message.reply_text(text=full_instruction_and_wait_text, parse_mode='HTML')
             logger.info(f"Sent final instruction to user {user_telegram_id}.")
         except Exception as e:
@@ -344,7 +422,6 @@ async def telegram_webhook():
             return "ok", 200
         except Exception as e:
             logger.error("Error processing Telegram update: %s", e)
-            # Trả về 200 OK ngay cả khi có lỗi xử lý để Telegram không gửi lại nhiều lần
             return "ok", 200
     return "Method Not Allowed", 405
 
@@ -358,15 +435,16 @@ def health_check():
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log the error and send a telegram message to notify the developer."""
     logger.error("Exception while handling an update:", exc_info=context.error)
-    # Bạn có thể thêm logic để gửi thông báo lỗi đến một admin chat_id cụ thể ở đây
-    # if context.bot and update:
-    #     try:
-    #         # Lấy chat_id của admin từ biến môi trường hoặc cấu hình
-    #         admin_chat_id = os.getenv("ADMIN_CHAT_ID")
-    #         if admin_chat_id:
-    #             await context.bot.send_message(chat_id=admin_chat_id, text=f"Error: {context.error}\nUpdate: {update}")
-    #     except Exception as send_error:
-    #         logger.error(f"Failed to send error notification: {send_error}")
+    # Gửi thông báo lỗi đến ADMIN_CHAT_ID (nếu được cấu hình)
+    if ADMIN_CHAT_ID:
+        try:
+            error_message_for_admin = f"❌ Bot Error ❌\n\nUpdate: {update}\n\nError: {context.error}"
+            if len(error_message_for_admin) > 4000:
+                error_message_for_admin = error_message_for_admin[:3900] + "\n... (truncated)"
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=error_message_for_admin)
+            logger.info(f"Error notification sent to ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
+        except Exception as send_error:
+            logger.error(f"Failed to send error notification to admin: {send_error}")
 
 
 # --- Main Application Logic (Entry Point) ---
@@ -401,7 +479,6 @@ async def run_full_application():
         logger.info("Telegram webhook set successfully.")
     except Exception as e:
         logger.error("Error setting Telegram webhook: %s", e)
-        # Có thể chọn dừng ứng dụng nếu không thể thiết lập webhook
         raise SystemExit("Failed to set webhook. Exiting.")
 
     logger.info("Flask app (via Hypercorn) listening on port %d", PORT)
