@@ -1,6 +1,8 @@
 python-telegram-bot==20.6
 Flask[async]
 hypercorn
+requests # Thêm dòng này để đảm bảo requests được cài đặt
+aiohttp # giữ nếu bạn cần cho việc khác, hoặc xóa nếu không dùng
 python-dotenv
 pandas
 openpyxl
