@@ -5,9 +5,9 @@ import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TelegramError, BadRequest
+from telegram.error import TelegramError, BadRequest 
 
-from flask import Flask, request, jsonify # Giữ Flask cho health check và có thể là các API khác nếu cần
+from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
@@ -17,10 +17,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app giờ chỉ dùng cho health check
 flask_app = Flask(__name__)
-# Ứng dụng Telegram Bot
-application = None 
+application = None # Sẽ được khởi tạo trong run_full_application
 
 WEBHOOK_PATH = "/webhook_telegram"
 
@@ -319,7 +317,6 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.info(f"Sent code '{final_rep3_text}' for user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
 
                 if user_is_member_of_channel: 
-                    # Kích hoạt việc lên lịch xóa, trừ khi user_telegram_id là ADMIN_CHAT_ID
                     asyncio.create_task(schedule_kick_user(context, CHANNEL_CHAT_ID, user_telegram_id))
                     logger.info(f"User {user_telegram_id} scheduled for kick from channel {CHANNEL_CHAT_ID}.")
 
@@ -347,14 +344,50 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text("不明な操作です。")
 
 
-# --- Flask Endpoint cho Health Check (và có thể các API khác) ---
+# --- Flask Endpoints ---
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+async def telegram_webhook():
+    """Xử lý các cập nhật Telegram đến qua webhook."""
+    global application # Đảm bảo truy cập biến global application
+
+    if application is None:
+        logger.error("Telegram Application object not initialized yet.")
+        return "Internal Server Error: Bot not ready", 500
+
+    if request.method == "POST":
+        try:
+            json_data = request.get_json(force=True)
+            if not json_data:
+                logger.warning("Received empty or invalid JSON payload from webhook.")
+                return "Bad Request", 400
+
+            update = Update.de_json(json_data, application.bot)
+            
+            # --- KHẮC PHỤC LỖI EVENT LOOP IS CLOSED ---
+            # Đảm bảo có một event loop đang hoạt động cho tác vụ này
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                logger.info("New event loop created and set for this request.")
+            
+            # Chạy process_update trong event loop hiện tại
+            await application.process_update(update)
+            logger.info("Successfully processed Telegram update.")
+            return "ok", 200
+        except Exception as e:
+            logger.error("Error processing Telegram update: %s", e)
+            return "ok", 200 # Trả về 200 OK để Telegram không gửi lại nhiều lần
+    return "Method Not Allowed", 405
+
 @flask_app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint for Render's health checks."""
     return jsonify({"status": "ok"})
 
 
-# --- Global Error Handler cho Application ---
+# --- Global Error Handler for Application ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
     if ADMIN_CHAT_ID:
@@ -374,7 +407,7 @@ async def run_full_application():
 
     TOKEN = os.getenv("BOT_TOKEN")
     BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-    PORT = int(os.getenv("PORT", 8443))
+    PORT = int(os.getenv("PORT", 8443)) # Render sẽ dùng 10000
 
     if not TOKEN:
         logger.critical("BOT_TOKEN environment variable not set. Exiting.")
@@ -394,28 +427,6 @@ async def run_full_application():
 
     await application.initialize()
 
-    # THAY ĐỔI LỚN TẠI ĐÂY:
-    # Hypercorn sẽ phục vụ cả ứng dụng Telegram Bot (là một ASGI app)
-    # và Flask app (cho health check).
-    # Chúng ta cần một ứng dụng ASGI chính mà Hypercorn có thể chạy.
-    # python-telegram-bot có thể tự tạo một ASGI application.
-
-    # Tuy nhiên, cách tốt nhất để kết hợp Flask và PTB ASGI app là dùng một ASGI wrapper.
-    # Nhưng vì bạn đã có Flask đang chạy trên cùng cổng, chúng ta sẽ để Flask là chính
-    # và để PTB webhook chạy bên trong Flask.
-    # Lỗi 'Event loop is closed' vẫn có thể xảy ra do cách Render quản lý process.
-
-    # Cách tiếp cận trước đó của bạn (Flask nhận webhook và gọi process_update)
-    # là cách phổ biến và thường hoạt động. Lỗi bạn gặp có thể do:
-    # 1. Quản lý event loop của Render: Render có thể đóng process hoặc event loop
-    #    mà không báo trước, gây ra lỗi.
-    # 2. Xung đột ngầm giữa Flask/Hypercorn và PTB's asyncio usage.
-
-    # Phương án an toàn hơn nếu muốn dùng run_webhook() là chạy PTB Application
-    # như một ứng dụng độc lập trên một cổng khác, hoặc sử dụng một ASGI gateway
-    # để định tuyến các request đến đúng ứng dụng.
-    # Tuy nhiên, trên Render, việc chạy nhiều dịch vụ trên cùng một cổng phức tạp hơn.
-
     logger.info("Setting Telegram webhook to: %s", FULL_WEBHOOK_URL)
     try:
         await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
@@ -428,81 +439,7 @@ async def run_full_application():
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     
-    # Để giải quyết lỗi 'Event loop is closed', chúng ta sẽ cố gắng sử dụng
-    # `application.run_webhook()` và phục vụ nó bằng Hypercorn.
-    # Điều này sẽ bỏ qua Flask cho webhook xử lý.
-    # Tuy nhiên, nếu bạn vẫn muốn /health check qua Flask, chúng ta cần một cơ chế khác.
-    # Ví dụ: chạy Flask trên một cổng khác hoặc tạo một ASGI app tổng hợp.
-
-    # Với lỗi bạn đang gặp, giải pháp khả dĩ nhất là **chuyển sang chỉ chạy PTB's webhook app**
-    # nếu health check không quá quan trọng hoặc có thể được xử lý bởi Render.
-
-    # Option 1: Chỉ chạy PTB Webhook (Nếu bạn không cần Flask API khác)
-    # await serve(application.webhooks_app, config)
-    # Option 2: Chạy Flask với webhook handler như bạn đã có (có thể gặp lỗi event loop)
-
-    # Vấn đề là bạn đang muốn cả Flask và PTB cùng chia sẻ một Hypercorn server.
-    # Điều này cần một ASGI wrapper như `Starlette` hoặc `FastAPI` để định tuyến request.
-    # Nhưng để tối ưu và giảm thiểu lỗi, chúng ta sẽ thử **chạy riêng ứng dụng webhook của PTB**.
-    # Điều này có nghĩa là endpoint `/webhook_telegram` sẽ được xử lý bởi PTB,
-    # còn `/health` của Flask sẽ không thể truy cập được trên cùng cổng.
-
-    # Để giữ health check, cách tốt nhất là có một ASGI app chung.
-    # Nhưng để giảm lỗi, chúng ta sẽ tập trung vào việc xử lý webhook.
-
-    # KHÔNG THỂ CHẠY CẢ FLASK VÀ PTB APPLICATION TRỰC TIẾP CÙNG LÚC TRÊN CÙNG CỔNG
-    # BẰNG hypercorn.asyncio.serve() MÀ KHÔNG CÓ ASGI DISPATCHER.
-
-    # Lỗi `RuntimeError('Event loop is closed')` thường xuất hiện khi Hypercorn
-    # hoặc Flask cố gắng sử dụng một event loop đã bị đóng bởi một phần khác
-    # của ứng dụng (hoặc bởi chính môi trường runtime của Render).
-    # Điều này cho thấy có sự xung đột trong cách event loop được quản lý.
-
-    # Giải pháp tối ưu nhất cho vấn đề này là để `python-telegram-bot` tự quản lý webhook
-    # hoàn toàn, và nếu cần health check, hãy đặt nó trên một cổng khác hoặc dùng một công cụ khác.
-
-    # Tuy nhiên, nếu bạn muốn giữ Flask cho health check và các mục đích khác,
-    # chúng ta phải quay lại cách cũ (Flask nhận webhook và gọi process_update),
-    # nhưng cố gắng làm cho nó robust hơn hoặc chấp nhận lỗi đó là do môi trường.
-
-    # NHỮNG THAY ĐỔI HIỆN TẠI:
-    # 1. Loại bỏ hàm `telegram_webhook` trong Flask.
-    # 2. Để PTB Application tự chạy webhook listener của nó.
-    # 3. Để Hypercorn phục vụ PTB Application (là một ASGI app).
-    # 4. Health check của Flask sẽ không hoạt động trên cùng cổng nữa.
-
-    # Để giải quyết lỗi `RuntimeError('Event loop is closed')` một cách triệt để
-    # khi chạy cả Flask và python-telegram-bot webhooks trên **cùng một cổng**
-    # với Hypercorn, chúng ta cần một **ASGI Router/Dispatcher**.
-
-    # Một cách tiếp cận là sử dụng một thư viện ASGI nhỏ như `Starlette` hoặc `FastAPI`
-    # làm bộ định tuyến chính, sau đó mount Flask app và PTB webhook app vào đó.
-    # Tuy nhiên, việc này sẽ làm tăng độ phức tạp.
-
-    # PHƯƠNG ÁN ĐƠN GIẢN HƠN: Chạy PTB Webhook Application.
-    # Nếu bạn chỉ cần health check thì Render có thể kiểm tra cổng của app.
-    # Bạn có thể bỏ `flask_app` và chỉ chạy `application.webhooks_app`
-
-    # Thay đổi lại `run_full_application`
-    # Chạy `application.run_webhook()` sẽ khởi tạo một ASGI application
-    # mà bạn có thể truyền vào `hypercorn.asyncio.serve`.
-    # Đây là cách chính thống để chạy PTB webhooks với ASGI.
-    
-    # Chúng ta sẽ truyền `application.webhooks_app` vào `serve`
-    # và bỏ qua `flask_app` trong phần chính để tránh xung đột event loop.
-    # Health check vẫn có thể hoạt động nếu Render kiểm tra endpoint mặc định của webhook.
-
-    await serve(application.webhooks_app, config)
-    # Lưu ý: Nếu bạn muốn chạy Flask cho /health và các API khác,
-    # bạn cần một ASGI dispatcher để định tuyến requests.
-    # Ví dụ với FastAPI/Starlette:
-    # app = FastAPI()
-    # @app.get("/health")
-    # async def health_check_api(): return {"status": "ok"}
-    # app.mount(WEBHOOK_PATH, WSGIMiddleware(flask_app)) # Không, PTB là ASGI.
-    # app.mount(WEBHOOK_PATH, application.webhooks_app) # Đây là cách đúng
-    # await serve(app, config)
-    # Nhưng điều này phức tạp hơn. Hãy thử cách tối giản nhất để loại bỏ lỗi.
+    await serve(flask_app, config)
 
 
 if __name__ == '__main__':
