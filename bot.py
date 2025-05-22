@@ -4,18 +4,76 @@ import asyncio
 import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+# Cần import Request từ telegram.request
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TelegramError, BadRequest 
+from telegram.error import TelegramError, BadRequest
+
+from telegram.request import Request as TGRequest # Import Request từ PTB
+import requests # Đảm bảo requests được import
 
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# --- Cấu hình Logging ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ... (giữ nguyên các phần trên) ...
+
+# --- Logic ứng dụng chính (Điểm khởi đầu) ---
+async def run_full_application():
+    global application
+
+    TOKEN = os.getenv("BOT_TOKEN")
+    BASE_WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    PORT = int(os.getenv("PORT", 8443)) # Render sẽ dùng 10000
+
+    if not TOKEN:
+        logger.critical("Biến môi trường BOT_TOKEN chưa được đặt. Đang thoát.")
+        raise ValueError("Biến môi trường BOT_TOKEN chưa được đặt.")
+    if not BASE_WEBHOOK_URL:
+        logger.critical("Biến môi trường WEBHOOK_URL chưa được đặt. Đang thoát.")
+        raise ValueError("Biến môi trường WEBHOOK_URL chưa được đặt.")
+
+    FULL_WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
+
+    # --- THAY ĐỔI Ở ĐÂY: Tạo một đối tượng Request sử dụng requests ---
+    # `requests` không phải là async, nhưng PTB sẽ tự động xử lý nó trong một thread pool
+    # để không chặn event loop chính.
+    request_obj = TGRequest(
+        # proxy_url=..., # Nếu bạn cần proxy
+        # base_url=..., # Nếu bạn dùng local Telegram Bot API server
+        connection_pool_size=5, # Tùy chỉnh kích thước pool nếu cần
+        read_timeout=20, # Tăng thời gian chờ đọc
+        connect_timeout=20 # Tăng thời gian chờ kết nối
+    )
+
+    application = ApplicationBuilder().token(TOKEN).request(request_obj).build() # Truyền request_obj vào đây
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_button_press))
+    application.add_error_handler(error_handler)
+
+    await application.initialize()
+
+    logger.info("Đang đặt webhook Telegram thành: %s", FULL_WEBHOOK_URL)
+    try:
+        await application.bot.set_webhook(url=FULL_WEBHOOK_URL)
+        logger.info("Đã đặt webhook Telegram thành công.")
+    except Exception as e:
+        logger.error("Lỗi khi đặt webhook Telegram: %s", e)
+        raise SystemExit("Không đặt được webhook. Đang thoát.")
+
+    logger.info("Ứng dụng Flask (qua Hypercorn) đang lắng nghe trên cổng %d", PORT)
+    config = Config()
+    config.bind = [f"0.0.0.0:{PORT}"]
+    
+    await serve(flask_app, config)
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(run_full_application())
+    except Exception as e:
+        logger.critical("Ứng dụng đã dừng do lỗi không được xử lý: %s", e)
 
 # --- Khởi tạo Flask và Application ---
 flask_app = Flask(__name__)
