@@ -5,6 +5,7 @@ import pandas as pd
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram.error import TelegramError # Import để bắt lỗi cụ thể của Telegram
 
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
@@ -78,16 +79,22 @@ LEVEL_KEY = "key"
 LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 
-# Thông tin kênh chat và hướng dẫn
-TELEGRAM_CHANNEL_LINK = "https://t.me/+JlQulVIHX5AwOGVI"
+# CHỈ LẤY CHANNEL_CHAT_ID TỪ BIẾN MÔI TRƯỜNG
+CHANNEL_CHAT_ID = os.getenv("TELEGRAM_CHANNEL_CHAT_ID", "") # Mặc định là chuỗi rỗng nếu không tìm thấy
 
 # Thông điệp chào mừng ban đầu
 INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
 
-# Thông điệp hướng dẫn gửi mã số đến kênh Telegram
-INSTRUCTION_MESSAGE_JP = f"受け取った番号を、到着の10分前までにこちらのチャンネル <a href='{TELEGRAM_CHANNEL_LINK}'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！"
+# Thông điệp nhắc nhở chờ phản hồi hoặc nhấn lại nút
+WAIT_FOR_RESPONSE_MESSAGE_JP = "\n\n**処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
 
-# Thông điệp thông tin về thời gian chờ
+# Thông điệp hướng dẫn sau khi bot đã xử lý (cố gắng) thêm vào kênh và gửi mã số
+POST_CODE_SUCCESS_MESSAGE_JP = "お客様の番号は公式チャンネルに送信され、チャンネルへの追加が試行されました。ご確認ください。"
+POST_CODE_FAIL_MESSAGE_JP = "申し訳ございません。チャンネルへの追加または番号の送信に問題が発生しました。手動でチャンネルに参加して、番号をご確認ください。" # Thêm chỗ này nếu cần link kênh trực tiếp
+POST_CODE_NO_CONFIG_MESSAGE_JP = "チャンネルへの自動追加が設定されていないため、番号はチャンネルに送信されません。手動でチャンネルに参加して番号をご確認ください。"
+
+
+# Thông điệp thông tin về thời gian chờ (dành cho final message)
 WAIT_TIME_MESSAGE_JP = "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。"
 
 # Thông điệp nhắc nhở khi người dùng gõ text không phải lệnh
@@ -191,10 +198,11 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_key_display}\n次に進んでください:", reply_markup=reply_markup)
+                # Thêm thông báo chờ vào đây
+                await query.edit_message_text(text=f"選択されました: {selected_key_display}\n次に進んでください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
             except Exception as e:
                 logger.warning("Could not edit message for REP1 (message ID: %s): %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_key_display}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_key_display}\n以下の選択肢からお選びください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_key_display}\n情報が見つかりません。")
@@ -218,10 +226,11 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             try:
-                await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n次に進んでください:", reply_markup=reply_markup)
+                # Thêm thông báo chờ vào đây
+                await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n次に進んでください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
             except Exception as e:
                 logger.warning("Could not edit message for REP2 (message ID: %s): %s", query.message.message_id, e)
-                await query.message.reply_text(f"選択されました: {selected_rep1_display}\n以下の選択肢からお選びください:", reply_markup=reply_markup)
+                await query.message.reply_text(f"選択されました: {selected_rep1_display}\n以下の選択肢からお選びください:{WAIT_FOR_RESPONSE_MESSAGE_JP}", reply_markup=reply_markup, parse_mode='Markdown')
         else:
             try:
                 await query.edit_message_text(text=f"選択されました: {selected_rep1_display}\n情報が見つかりません。")
@@ -239,23 +248,71 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 final_rep3_text = row["Rep3"]
                 break
         
+        user_telegram_id = query.from_user.id
+        user_full_name = query.from_user.full_name or f"User ID: {user_telegram_id}"
+        message_to_channel = f"{final_rep3_text} - {user_full_name}"
+
+        # Gửi REP3 thành tin nhắn riêng cho người dùng trước
         try:
-            # Gửi REP3 thành tin nhắn riêng
             await query.edit_message_text(text=f"あなたの番号: {final_rep3_text}")
+            logger.info(f"Sent Rep3 to user {user_telegram_id}.")
         except Exception as e:
             logger.warning("Could not edit message (sending Rep3, message ID: %s): %s", query.message.message_id, e)
             await query.message.reply_text(text=f"あなたの番号: {final_rep3_text}")
         
-        # Gửi tin nhắn hướng dẫn và thời gian chờ tiếp theo
-        full_instruction_and_wait_text = f"{INSTRUCTION_MESSAGE_JP}\n\n{WAIT_TIME_MESSAGE_JP}"
+        # --- Logic thêm người dùng vào kênh và gửi mã số ---
+        instruction_message_for_user = ""
+
+        if CHANNEL_CHAT_ID: # Chỉ thực hiện nếu CHANNEL_CHAT_ID được thiết lập
+            try:
+                # Cố gắng thêm thành viên. Lưu ý: Chỉ hoạt động nếu kênh là Supergroup
+                # và bot là admin với quyền "Invite Users" (can_invite_users=True)
+                # và người dùng đã chat với bot trước đó.
+                # set_chat_member status='member' là cách để thêm thành viên mới nhất
+                await context.bot.set_chat_member(
+                    chat_id=CHANNEL_CHAT_ID,
+                    user_id=user_telegram_id,
+                    status='member' # Đặt trạng thái là 'member' để thêm vào
+                )
+                logger.info(f"Attempted to add user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
+                
+                # Gửi tin nhắn mã số vào kênh
+                await context.bot.send_message(
+                    chat_id=CHANNEL_CHAT_ID,
+                    text=message_to_channel
+                )
+                logger.info(f"Sent code '{final_rep3_text}' for user {user_telegram_id} to channel {CHANNEL_CHAT_ID}.")
+                instruction_message_for_user = POST_CODE_SUCCESS_MESSAGE_JP
+
+            except TelegramError as e:
+                logger.error(f"Telegram API Error adding user {user_telegram_id} or sending message to channel {CHANNEL_CHAT_ID}: {e}")
+                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (Lỗi: {e.message})"
+                # Nếu bot không thể thêm, có thể tạo link mời và gửi cho người dùng
+                try:
+                    # Tạo link mời có giới hạn 1 thành viên để chỉ dùng 1 lần
+                    invite_link = await context.bot.create_chat_invite_link(chat_id=CHANNEL_CHAT_ID, member_limit=1)
+                    instruction_message_for_user += f"\n\nまたは、このリンクから手動で参加してください: <a href='{invite_link.invite_link}'>チャンネルに参加</a>"
+                except Exception as link_e:
+                    logger.error(f"Could not create invite link: {link_e}")
+                    instruction_message_for_user += "\n\n(リンクを作成できませんでした)"
+
+            except Exception as e:
+                logger.error(f"General Error adding user {user_telegram_id} or sending message to channel {CHANNEL_CHAT_ID}: {e}")
+                instruction_message_for_user = f"{POST_CODE_FAIL_MESSAGE_JP} (Lỗi chung: {e})"
+        else:
+            logger.warning("CHANNEL_CHAT_ID is not set. Skipping adding user to channel and sending message to channel.")
+            instruction_message_for_user = POST_CODE_NO_CONFIG_MESSAGE_JP
+            
+        # Gửi tin nhắn hướng dẫn và thời gian chờ tiếp theo cho người dùng (vào chat riêng của họ)
+        full_instruction_and_wait_text = f"{instruction_message_for_user}\n\n{WAIT_TIME_MESSAGE_JP}"
         
         try:
-            # Sử dụng parse_mode='HTML' để link được hiển thị đúng
+            # Sử dụng parse_mode='HTML' nếu bạn có thể có link mời trong instruction_message_for_user
             await query.message.reply_text(text=full_instruction_and_wait_text, parse_mode='HTML')
+            logger.info(f"Sent final instruction to user {user_telegram_id}.")
         except Exception as e:
-            logger.error("Could not send final instruction message: %s", e)
-            # Log lỗi nhưng không chặn hoạt động của bot
-            pass # Không cần raise Exception ở đây
+            logger.error("Could not send final instruction message to user: %s", e)
+            pass
 
     else:
         try:
