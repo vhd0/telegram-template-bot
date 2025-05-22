@@ -79,13 +79,16 @@ LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 
 # Thông tin kênh chat và hướng dẫn
-TELEGRAM_CHANNEL_LINK = "https://t.me/mikami8186lt"
+TELEGRAM_CHANNEL_LINK = "https://t.me/+JlQulVIHX5AwOGVI"
 
 # Thông điệp chào mừng ban đầu
-INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。"
+INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
 
-# Thông điệp hướng dẫn cuối cùng
+# Thông điệp hướng dẫn gửi mã số đến kênh Telegram
 INSTRUCTION_MESSAGE_JP = f"受け取った番号を、到着の10分前までにこちらのチャンネル <a href='{TELEGRAM_CHANNEL_LINK}'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！"
+
+# Thông điệp thông tin về thời gian chờ
+WAIT_TIME_MESSAGE_JP = "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。"
 
 # Thông điệp nhắc nhở khi người dùng gõ text không phải lệnh
 UNRECOGNIZED_MESSAGE_JP = "何を言っているのか分かりません。選択肢を始めるか、選択ボードを再起動するには、/start と入力してください。"
@@ -112,7 +115,8 @@ async def send_initial_key_buttons(update_object: Update):
 
     user_telegram_id = update_object.message.from_user.id
     logger.info(f"Sending initial welcome message to user ID: {user_telegram_id}")
-    await update_object.message.reply_text(INITIAL_WELCOME_MESSAGE_JP, reply_markup=reply_markup)
+    # Sử dụng parse_mode='Markdown' để bold đoạn văn bản
+    await update_object.message.reply_text(INITIAL_WELCOME_MESSAGE_JP, reply_markup=reply_markup, parse_mode='Markdown')
 
 
 # --- Telegram Bot Handlers ---
@@ -226,24 +230,32 @@ async def handle_button_press(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.message.reply_text(f"選択されました: {selected_rep1_display}\n情報が見つかりません。")
 
     elif current_level == LEVEL_REP2:
-        final_text = "情報が見つかりません。"
+        final_rep3_text = "情報が見つかりません。"
         for row in DATA_TABLE:
             # So sánh với ID của Key, Rep1, Rep2 đã chọn
             if get_or_create_id(row["Key"]) == selected_key_id and \
                get_or_create_id(row["Rep1"]) == selected_rep1_id and \
                get_or_create_id(row["Rep2"]) == selected_rep2_id:
-                final_text = row["Rep3"]
+                final_rep3_text = row["Rep3"]
                 break
         
-        # Thêm hướng dẫn và link vào final_text
-        full_response_text = f"{final_text}\n\n{INSTRUCTION_MESSAGE_JP}"
-
+        try:
+            # Gửi REP3 thành tin nhắn riêng
+            await query.edit_message_text(text=f"あなたの番号: {final_rep3_text}")
+        except Exception as e:
+            logger.warning("Could not edit message (sending Rep3, message ID: %s): %s", query.message.message_id, e)
+            await query.message.reply_text(text=f"あなたの番号: {final_rep3_text}")
+        
+        # Gửi tin nhắn hướng dẫn và thời gian chờ tiếp theo
+        full_instruction_and_wait_text = f"{INSTRUCTION_MESSAGE_JP}\n\n{WAIT_TIME_MESSAGE_JP}"
+        
         try:
             # Sử dụng parse_mode='HTML' để link được hiển thị đúng
-            await query.edit_message_text(text=full_response_text, parse_mode='HTML')
+            await query.message.reply_text(text=full_instruction_and_wait_text, parse_mode='HTML')
         except Exception as e:
-            logger.warning("Could not edit message (final, message ID: %s): %s", query.message.message_id, e)
-            await query.message.reply_text(text=full_response_text, parse_mode='HTML')
+            logger.error("Could not send final instruction message: %s", e)
+            # Log lỗi nhưng không chặn hoạt động của bot
+            pass # Không cần raise Exception ở đây
 
     else:
         try:
