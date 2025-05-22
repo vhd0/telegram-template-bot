@@ -1,7 +1,6 @@
 python-telegram-bot==20.6
 Flask[async]
 hypercorn
-httpx
 python-dotenv
 pandas
 openpyxl
