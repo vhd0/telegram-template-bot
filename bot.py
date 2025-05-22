@@ -79,7 +79,7 @@ LEVEL_REP1 = "rep1"
 LEVEL_REP2 = "rep2"
 
 # Thông tin kênh chat và hướng dẫn
-TELEGRAM_CHANNEL_LINK = "https://t.me/+JlQulVIHX5AwOGVI"
+TELEGRAM_CHANNEL_LINK = "https://t.me/mikami8186lt"
 
 # Thông điệp chào mừng ban đầu
 INITIAL_WELCOME_MESSAGE_JP = "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**"
