@@ -1,6 +1,8 @@
 python-telegram-bot==20.6
-Flask[async]
+Flask             # Bỏ [async]
 hypercorn
+requests
 python-dotenv
 pandas
 openpyxl
+# aiohttp (Đảm bảo không có dòng này nếu có)
