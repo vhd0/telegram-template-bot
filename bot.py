@@ -80,13 +80,14 @@ class BotState:
         self.welcomed_users: Set[int] = set()
         self.last_refresh: float = 0
         self._requests: Dict[int, List[float]] = defaultdict(list)
+        self.user_messages: Dict[int, Dict[str, int]] = defaultdict(dict)
+        self.last_user_activity: Dict[int, float] = {}
 
     def can_request(self, user_id: int, window: int = 60) -> bool:
         """Check if user can make a request (rate limiting)"""
         now = time.time()
         user_requests = self._requests[user_id]
         
-        # Clean old requests
         while user_requests and user_requests[0] < now - window:
             user_requests.pop(0)
         
@@ -110,6 +111,27 @@ class BotState:
     def get_string(self, id: int) -> str:
         """Get string from ID"""
         return self.id_strings.get(id, '')
+
+    def update_activity(self, user_id: int) -> None:
+        """Update last activity time for user"""
+        self.last_user_activity[user_id] = time.time()
+
+    def reset_user(self, user_id: int) -> None:
+        """Reset all state for a specific user"""
+        self.welcomed_users.discard(user_id)
+        self.user_messages.pop(user_id, None)
+        self._requests.pop(user_id, None)
+        self.update_activity(user_id)
+
+    async def cleanup_user_messages(self, user_id: int, chat_id: int, bot) -> None:
+        """Clean up old messages for a user"""
+        if user_id in self.user_messages:
+            for msg_id in self.user_messages[user_id].values():
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                except Exception as e:
+                    logger.warning(f"Could not delete message {msg_id}: {e}")
+            self.user_messages[user_id].clear()
 
 state = BotState()
 
@@ -138,7 +160,6 @@ def load_excel_data() -> List[dict]:
         df = df.fillna('')
         data = df.astype(str).to_dict(orient='records')
         
-        # Validate data
         valid_data = []
         for row in data:
             try:
@@ -164,7 +185,6 @@ def refresh_data() -> None:
             state.data = new_data
             state.last_refresh = now
             
-            # Update ID mappings
             for row in state.data:
                 for field in ["Key", "Rep1", "Rep2"]:
                     if row[field]:
@@ -175,50 +195,71 @@ def refresh_data() -> None:
             logger.warning("No data loaded during refresh")
 
 # --- Message Handlers ---
-async def send_message(update: Update, text: str, markup=None, parse_mode=None) -> None:
-    """Send message with retry logic"""
-    for attempt in range(3):
-        try:
-            await update.message.reply_text(
-                text=text,
-                reply_markup=markup,
-                parse_mode=parse_mode
-            )
-            return
-        except Exception as e:
-            if attempt == 2:  # Last attempt
-                logger.error(f"Failed to send message: {e}")
-                raise
-            await asyncio.sleep(1)  # Wait before retry
-
 async def send_initial_buttons(update: Update) -> None:
     """Send welcome message with initial options"""
-    refresh_data()
+    try:
+        refresh_data()
+        
+        if not state.data:
+            await update.message.reply_text(MESSAGES["no_data"])
+            return
+        
+        initial_keys = {row["Key"] for row in state.data if row["Key"]}
+        if not initial_keys:
+            await update.message.reply_text(MESSAGES["no_data"])
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton(key, callback_data=f"key:{state.get_id(key)}::")]
+            for key in sorted(initial_keys)
+        ]
+        
+        # Send new welcome message
+        message = await update.message.reply_text(
+            MESSAGES["welcome"],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        
+        # Store message ID
+        user_id = update.effective_user.id
+        state.user_messages[user_id]['welcome'] = message.message_id
+        
+    except Exception as e:
+        logger.error(f"Error sending initial buttons: {e}")
+        await update.message.reply_text(MESSAGES["error"])
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
-    if not state.data:
-        await send_message(update, MESSAGES["no_data"])
+    if not state.can_request(user_id):
+        await update.message.reply_text(MESSAGES["rate_limit"])
         return
     
-    initial_keys = {row["Key"] for row in state.data if row["Key"]}
-    if not initial_keys:
-        await send_message(update, MESSAGES["no_data"])
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton(key, callback_data=f"key:{state.get_id(key)}::")]
-        for key in sorted(initial_keys)
-    ]
-    
-    await send_message(
-        update,
-        MESSAGES["welcome"],
-        InlineKeyboardMarkup(keyboard),
-        'Markdown'
-    )
+    try:
+        # Clean up old messages
+        await state.cleanup_user_messages(user_id, chat_id, context.bot)
+        
+        # Reset user state
+        state.reset_user(user_id)
+        
+        # Send new welcome message
+        await send_initial_buttons(update)
+        state.welcomed_users.add(user_id)
+        state.update_activity(user_id)
+        
+        logger.info(f"User restarted: {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Error in start handler: {e}")
+        await update.message.reply_text(MESSAGES["error"])
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming messages"""
     user_id = update.effective_user.id
+    state.update_activity(user_id)
     
     if not state.can_request(user_id):
         await update.message.reply_text(MESSAGES["rate_limit"])
@@ -231,25 +272,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         await update.message.reply_text(MESSAGES["restart"])
 
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
-    user_id = update.effective_user.id
-    
-    if not state.can_request(user_id):
-        await update.message.reply_text(MESSAGES["rate_limit"])
-        return
-    
-    state.welcomed_users.discard(user_id)
-    await send_initial_buttons(update)
-    state.welcomed_users.add(user_id)
-    logger.info(f"User restarted: {user_id}")
-
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button callbacks"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
+    state.update_activity(user_id)
+    
     if not state.can_request(user_id):
         await query.message.reply_text(MESSAGES["rate_limit"])
         return
@@ -258,12 +288,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         async with asyncio.timeout(10):
             refresh_data()
             
-            # Parse callback data
             level, *ids = query.data.split(':')
             selected_ids = [int(id_) if id_ else -1 for id_ in ids]
             key_id, rep1_id, rep2_id = selected_ids + [-1] * (3 - len(selected_ids))
             
-            # Get display values
             key = state.get_string(key_id)
             rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
             rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
@@ -326,10 +354,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
                 
                 await query.edit_message_text(f"あなたの番号: {rep3}")
-                await query.message.reply_text(
+                
+                # Store final message
+                final_msg = await query.message.reply_text(
                     f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
                     parse_mode='HTML'
                 )
+                state.user_messages[user_id]['final'] = final_msg.message_id
             
             else:
                 await query.edit_message_text(MESSAGES["error"])
@@ -340,6 +371,21 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Button handler error: {e}")
         await query.message.reply_text(MESSAGES["error"])
+
+async def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cleanup old messages periodically"""
+    try:
+        current_time = time.time()
+        for user_id in list(state.last_user_activity.keys()):
+            if current_time - state.last_user_activity[user_id] > 3600:  # 1 hour
+                try:
+                    chat_id = user_id  # In private chats, chat_id equals user_id
+                    await state.cleanup_user_messages(user_id, chat_id, context.bot)
+                    state.reset_user(user_id)
+                except Exception as e:
+                    logger.warning(f"Could not cleanup for user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Error in cleanup task: {e}")
 
 # --- Flask Routes ---
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
@@ -368,7 +414,8 @@ def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0",
         "data_status": "loaded" if state.data else "empty",
-        "last_refresh": datetime.fromtimestamp(state.last_refresh).isoformat() if state.last_refresh else None
+        "last_refresh": datetime.fromtimestamp(state.last_refresh).isoformat() if state.last_refresh else None,
+        "active_users": len(state.welcomed_users)
     })
 
 # --- Error Handler ---
@@ -381,7 +428,6 @@ async def init_application():
     """Initialize application"""
     global application
 
-    # Configure logging
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -389,24 +435,23 @@ async def init_application():
     )
 
     try:
-        # Create bot application
         application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
 
-        # Add handlers
         application.add_handler(CommandHandler("start", handle_start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_button))
         application.add_error_handler(error_handler)
 
-        # Initialize bot and set webhook
+        # Add cleanup job
+        job_queue = application.job_queue
+        job_queue.run_repeating(cleanup_old_messages, interval=3600)
+
         await application.initialize()
         webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
         await application.bot.set_webhook(url=webhook_url)
         logger.info(f"Webhook set: {webhook_url}")
 
-        # Load initial data
         refresh_data()
-        
         return True
 
     except Exception as e:
