@@ -117,7 +117,7 @@ class BotState:
         self.last_user_activity[user_id] = time.time()
 
     def reset_user(self, user_id: int) -> None:
-        """Reset all state for a specific user"""
+        """Reset all state for a user"""
         self.welcomed_users.discard(user_id)
         self.user_messages.pop(user_id, None)
         self._requests.pop(user_id, None)
@@ -265,12 +265,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(MESSAGES["rate_limit"])
         return
     
-    if user_id not in state.welcomed_users:
-        await send_initial_buttons(update)
-        state.welcomed_users.add(user_id)
-        logger.info(f"New user welcomed: {user_id}")
-    else:
-        await update.message.reply_text(MESSAGES["restart"])
+    await update.message.reply_text(MESSAGES["restart"])
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle button callbacks"""
@@ -311,10 +306,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         for r1 in sorted(next_rep1)
                     ]
                     
-                    await query.edit_message_text(
+                    # Store message ID
+                    msg = await query.edit_message_text(
                         f"選択されました: {key}\n{MESSAGES['processing']}\n\n次に進んでください:",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
+                    state.user_messages[user_id]['key'] = msg.message_id
                 else:
                     await query.edit_message_text(
                         f"選択されました: {key}\n{MESSAGES['no_data']}"
@@ -335,10 +332,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         for r2 in sorted(next_rep2)
                     ]
                     
-                    await query.edit_message_text(
+                    # Store message ID
+                    msg = await query.edit_message_text(
                         f"選択されました: {rep1}\n{MESSAGES['processing']}\n\n次に進んでください:",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
+                    state.user_messages[user_id]['rep1'] = msg.message_id
                 else:
                     await query.edit_message_text(
                         f"選択されました: {rep1}\n{MESSAGES['no_data']}"
@@ -353,14 +352,15 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     MESSAGES["no_data"]
                 )
                 
-                await query.edit_message_text(f"あなたの番号: {rep3}")
+                # Store message IDs
+                msg1 = await query.edit_message_text(f"あなたの番号: {rep3}")
+                state.user_messages[user_id]['rep2'] = msg1.message_id
                 
-                # Store final message
-                final_msg = await query.message.reply_text(
+                msg2 = await query.message.reply_text(
                     f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
                     parse_mode='HTML'
                 )
-                state.user_messages[user_id]['final'] = final_msg.message_id
+                state.user_messages[user_id]['final'] = msg2.message_id
             
             else:
                 await query.edit_message_text(MESSAGES["error"])
@@ -371,21 +371,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Button handler error: {e}")
         await query.message.reply_text(MESSAGES["error"])
-
-async def cleanup_old_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cleanup old messages periodically"""
-    try:
-        current_time = time.time()
-        for user_id in list(state.last_user_activity.keys()):
-            if current_time - state.last_user_activity[user_id] > 3600:  # 1 hour
-                try:
-                    chat_id = user_id  # In private chats, chat_id equals user_id
-                    await state.cleanup_user_messages(user_id, chat_id, context.bot)
-                    state.reset_user(user_id)
-                except Exception as e:
-                    logger.warning(f"Could not cleanup for user {user_id}: {e}")
-    except Exception as e:
-        logger.error(f"Error in cleanup task: {e}")
 
 # --- Flask Routes ---
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
@@ -435,22 +420,22 @@ async def init_application():
     )
 
     try:
+        # Initialize bot application
         application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
 
+        # Add handlers
         application.add_handler(CommandHandler("start", handle_start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         application.add_handler(CallbackQueryHandler(handle_button))
         application.add_error_handler(error_handler)
 
-        # Add cleanup job
-        job_queue = application.job_queue
-        job_queue.run_repeating(cleanup_old_messages, interval=3600)
-
+        # Initialize bot and set webhook
         await application.initialize()
         webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
         await application.bot.set_webhook(url=webhook_url)
         logger.info(f"Webhook set: {webhook_url}")
 
+        # Load initial data
         refresh_data()
         return True
 
