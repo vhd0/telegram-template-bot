@@ -7,7 +7,8 @@ from collections import defaultdict
 from typing import Dict, List, Set, Optional
 from functools import lru_cache
 from datetime import datetime, timezone
-from pydantic import BaseModel, BaseSettings, Field
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings  # Changed this import
 from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,6 +23,8 @@ from telegram.ext import (
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
+
+# ... rest of the code remains the same ...
 
 # --- Custom Exceptions ---
 class BotError(Exception):
