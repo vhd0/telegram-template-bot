@@ -13,21 +13,15 @@ from pydantic_settings import BaseSettings
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler
+    ApplicationBuilder, CommandHandler, MessageHandler, 
+    ContextTypes, filters, CallbackQueryHandler
 )
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from asgiref.sync import async_to_sync
 
-# --- Settings Management ---
 class Settings(BaseSettings):
-    """Application settings with validation"""
     BOT_TOKEN: str
     WEBHOOK_URL: str
     PORT: int = Field(default=int(os.getenv('PORT', 8443)))
@@ -41,37 +35,20 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
 
-# --- Constants ---
-TELEGRAM_CHANNEL = "https://t.me/mikami8186lt"
 MESSAGES = {
-    "welcome": """三上はじめにへようこそ。以下の選択肢からお選びください。
-
-**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**""",
-    "processing": "ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。",
-    "instruction": f"受け取った番号を、到着の10分前までにこちらのチャンネル <a href='{TELEGRAM_CHANNEL}'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！",
+    "welcome": """三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**""",
+    "processing": "⏳ 処理中です...",
+    "next_step": "次に進んでください:",
+    "selected": "選択されました: {}",
+    "instruction": "受け取った番号を、到着の10分前までにこちらのチャンネル <a href='https://t.me/mikami8186lt'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！",
     "wait_time": "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。",
-    "no_data": "申し訳ありませんが、現在データを利用できません。しばらくしてからもう一度お試しください。",
+    "no_data": "申し訳ありませんが、現在データを利用できません。",
     "rate_limit": "多くのリクエストを送信しています。しばらくお待ちください。",
     "error": "エラーが発生しました。もう一度お試しください。",
-    "restart": "選択肢を始めるか、選択ボードを再起動するには、/start と入力してください。"
+    "number": "あなたの番号: {}"
 }
 
-# --- Initialize Apps ---
-settings = Settings()
-logger = logging.getLogger(__name__)
-flask_app = Flask(__name__)
-application = None
-
-# --- Data Models ---
-class ExcelData(BaseModel):
-    """Data model for Excel rows"""
-    Key: str
-    Rep1: str
-    Rep2: str
-    Rep3: str
-
-class BotState:
-    """Global state management"""
+class State:
     def __init__(self):
         self.data: List[dict] = []
         self.string_ids: Dict[str, int] = {}
@@ -80,28 +57,19 @@ class BotState:
         self.welcomed_users: Set[int] = set()
         self.last_refresh: float = 0
         self._requests: Dict[int, List[float]] = defaultdict(list)
-        self.user_messages: Dict[int, Dict[str, int]] = defaultdict(dict)
-        self.last_user_activity: Dict[int, float] = {}
+        self.processing: Dict[int, bool] = {}
 
-    def can_request(self, user_id: int, window: int = 60) -> bool:
-        """Check if user can make a request (rate limiting)"""
+    def can_request(self, user_id: int) -> bool:
         now = time.time()
-        user_requests = self._requests[user_id]
-        
-        while user_requests and user_requests[0] < now - window:
-            user_requests.pop(0)
-        
-        if len(user_requests) >= settings.MAX_REQUESTS_PER_MINUTE:
+        requests = self._requests[user_id] = [r for r in self._requests[user_id] if now - r < 60]
+        if len(requests) >= settings.MAX_REQUESTS_PER_MINUTE:
             return False
-            
-        user_requests.append(now)
+        requests.append(now)
         return True
 
     def get_id(self, text: str) -> int:
-        """Get or create ID for text"""
         if not text:
             return -1
-            
         if text not in self.string_ids:
             self.string_ids[text] = self.next_id
             self.id_strings[self.next_id] = text
@@ -109,283 +77,129 @@ class BotState:
         return self.string_ids[text]
 
     def get_string(self, id: int) -> str:
-        """Get string from ID"""
         return self.id_strings.get(id, '')
 
-    def update_activity(self, user_id: int) -> None:
-        """Update last activity time for user"""
-        self.last_user_activity[user_id] = time.time()
+settings = Settings()
+logger = logging.getLogger(__name__)
+flask_app = Flask(__name__)
+application = None
+state = State()
 
-    def reset_user(self, user_id: int) -> None:
-        """Reset all state for a user"""
-        self.welcomed_users.discard(user_id)
-        self.user_messages.pop(user_id, None)
-        self._requests.pop(user_id, None)
-        self.update_activity(user_id)
-
-    async def cleanup_user_messages(self, user_id: int, chat_id: int, bot) -> None:
-        """Clean up old messages for a user"""
-        if user_id in self.user_messages:
-            for msg_id in self.user_messages[user_id].values():
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except Exception as e:
-                    logger.warning(f"Could not delete message {msg_id}: {e}")
-            self.user_messages[user_id].clear()
-
-state = BotState()
-
-# --- Data Management ---
 @lru_cache(maxsize=1)
 def load_excel_data() -> List[dict]:
-    """Load and validate Excel data"""
     try:
-        file_path = Path(settings.EXCEL_FILE_PATH)
-        if not file_path.exists():
-            logger.error(f"Excel file not found: {file_path}")
-            return []
-
-        df = pd.read_excel(
-            file_path,
-            engine='openpyxl',
-            na_values=[''],
-            keep_default_na=False
-        )
-
-        required_cols = ["Key", "Rep1", "Rep2", "Rep3"]
-        if missing_cols := [col for col in required_cols if col not in df.columns]:
-            logger.error(f"Missing columns: {missing_cols}")
-            return []
-
+        df = pd.read_excel(settings.EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         df = df.fillna('')
-        data = df.astype(str).to_dict(orient='records')
-        
-        valid_data = []
-        for row in data:
-            try:
-                ExcelData(**row)
-                valid_data.append(row)
-            except Exception as e:
-                logger.warning(f"Invalid row data: {e}")
-                continue
-
-        logger.info(f"Loaded {len(valid_data)} valid rows")
-        return valid_data
-
+        return df.astype(str).to_dict(orient='records')
     except Exception as e:
         logger.error(f"Excel loading error: {e}")
         return []
 
 def refresh_data() -> None:
-    """Refresh cached data if needed"""
     now = time.time()
     if now - state.last_refresh > settings.CACHE_TTL:
         load_excel_data.cache_clear()
-        if new_data := load_excel_data():
-            state.data = new_data
+        if data := load_excel_data():
+            state.data = data
             state.last_refresh = now
-            
-            for row in state.data:
+            for row in data:
                 for field in ["Key", "Rep1", "Rep2"]:
                     if row[field]:
                         state.get_id(row[field])
-            
-            logger.info("Data cache refreshed")
-        else:
-            logger.warning("No data loaded during refresh")
 
-# --- Message Handlers ---
 async def send_initial_buttons(update: Update) -> None:
-    """Send welcome message with initial options"""
-    try:
-        refresh_data()
-        
-        if not state.data:
-            await update.message.reply_text(MESSAGES["no_data"])
-            return
-        
-        initial_keys = {row["Key"] for row in state.data if row["Key"]}
-        if not initial_keys:
-            await update.message.reply_text(MESSAGES["no_data"])
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton(key, callback_data=f"key:{state.get_id(key)}::")]
-            for key in sorted(initial_keys)
-        ]
-        
-        # Send new welcome message
-        message = await update.message.reply_text(
-            MESSAGES["welcome"],
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        
-        # Store message ID
-        user_id = update.effective_user.id
-        state.user_messages[user_id]['welcome'] = message.message_id
-        
-    except Exception as e:
-        logger.error(f"Error sending initial buttons: {e}")
-        await update.message.reply_text(MESSAGES["error"])
+    refresh_data()
+    if not state.data:
+        await update.message.reply_text(MESSAGES["no_data"])
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(key, callback_data=f"key:{state.get_id(key)}::")]
+        for key in sorted({row["Key"] for row in state.data if row["Key"]})
+    ]
+    
+    await update.message.reply_text(
+        MESSAGES["welcome"],
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     
     if not state.can_request(user_id):
         await update.message.reply_text(MESSAGES["rate_limit"])
         return
     
-    try:
-        # Clean up old messages
-        await state.cleanup_user_messages(user_id, chat_id, context.bot)
-        
-        # Reset user state
-        state.reset_user(user_id)
-        
-        # Send new welcome message
-        await send_initial_buttons(update)
-        state.welcomed_users.add(user_id)
-        state.update_activity(user_id)
-        
-        logger.info(f"User restarted: {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in start handler: {e}")
-        await update.message.reply_text(MESSAGES["error"])
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages"""
-    user_id = update.effective_user.id
-    state.update_activity(user_id)
-    
-    if not state.can_request(user_id):
-        await update.message.reply_text(MESSAGES["rate_limit"])
-        return
-    
-    await update.message.reply_text(MESSAGES["restart"])
+    state.welcomed_users.discard(user_id)
+    await send_initial_buttons(update)
+    state.welcomed_users.add(user_id)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks"""
     query = update.callback_query
-    await query.answer()
-    
     user_id = update.effective_user.id
-    state.update_activity(user_id)
     
-    if not state.can_request(user_id):
-        await query.message.reply_text(MESSAGES["rate_limit"])
+    if not state.can_request(user_id) or state.processing.get(user_id):
+        await query.answer(MESSAGES["processing"])
         return
-    
+
     try:
-        async with asyncio.timeout(10):
-            refresh_data()
-            
-            level, *ids = query.data.split(':')
-            selected_ids = [int(id_) if id_ else -1 for id_ in ids]
-            key_id, rep1_id, rep2_id = selected_ids + [-1] * (3 - len(selected_ids))
-            
-            key = state.get_string(key_id)
-            rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
-            rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
-            
-            if level == "key":
-                next_rep1 = {
-                    row["Rep1"] for row in state.data
-                    if row["Key"] == key and row["Rep1"]
-                }
-                
-                if next_rep1:
-                    keyboard = [
-                        [InlineKeyboardButton(
-                            r1,
-                            callback_data=f"rep1:{key_id}:{state.get_id(r1)}:"
-                        )]
-                        for r1 in sorted(next_rep1)
-                    ]
-                    
-                    # Store message ID
-                    msg = await query.edit_message_text(
-                        f"選択されました: {key}\n{MESSAGES['processing']}\n\n次に進んでください:",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    state.user_messages[user_id]['key'] = msg.message_id
-                else:
-                    await query.edit_message_text(
-                        f"選択されました: {key}\n{MESSAGES['no_data']}"
-                    )
-            
-            elif level == "rep1":
-                next_rep2 = {
-                    row["Rep2"] for row in state.data
-                    if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]
-                }
-                
-                if next_rep2:
-                    keyboard = [
-                        [InlineKeyboardButton(
-                            r2,
-                            callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}"
-                        )]
-                        for r2 in sorted(next_rep2)
-                    ]
-                    
-                    # Store message ID
-                    msg = await query.edit_message_text(
-                        f"選択されました: {rep1}\n{MESSAGES['processing']}\n\n次に進んでください:",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    state.user_messages[user_id]['rep1'] = msg.message_id
-                else:
-                    await query.edit_message_text(
-                        f"選択されました: {rep1}\n{MESSAGES['no_data']}"
-                    )
-            
-            elif level == "rep2":
-                rep3 = next(
-                    (row["Rep3"] for row in state.data
-                     if row["Key"] == key and
-                     row["Rep1"] == rep1 and
-                     row["Rep2"] == rep2),
-                    MESSAGES["no_data"]
+        state.processing[user_id] = True
+        await query.answer()
+        refresh_data()
+
+        level, *ids = query.data.split(':')
+        selected_ids = [int(id_) if id_ else -1 for id_ in ids]
+        key_id, rep1_id, rep2_id = selected_ids + [-1] * (3 - len(selected_ids))
+
+        key = state.get_string(key_id)
+        rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
+        rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
+
+        if level == "key":
+            next_rep1 = {row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]}
+            if next_rep1:
+                keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] 
+                          for r1 in sorted(next_rep1)]
+                await query.edit_message_text(
+                    f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                
-                # Store message IDs
-                msg1 = await query.edit_message_text(f"あなたの番号: {rep3}")
-                state.user_messages[user_id]['rep2'] = msg1.message_id
-                
-                msg2 = await query.message.reply_text(
-                    f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
-                    parse_mode='HTML'
+        
+        elif level == "rep1":
+            next_rep2 = {row["Rep2"] for row in state.data 
+                        if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]}
+            if next_rep2:
+                keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] 
+                          for r2 in sorted(next_rep2)]
+                await query.edit_message_text(
+                    f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                state.user_messages[user_id]['final'] = msg2.message_id
-            
-            else:
-                await query.edit_message_text(MESSAGES["error"])
-                
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout for user {user_id}")
-        await query.message.reply_text(MESSAGES["error"])
+        
+        elif level == "rep2":
+            rep3 = next((row["Rep3"] for row in state.data 
+                        if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2),
+                       MESSAGES["no_data"])
+            await query.edit_message_text(MESSAGES["number"].format(rep3))
+            await query.message.reply_text(
+                f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
+                parse_mode='HTML'
+            )
+
     except Exception as e:
         logger.error(f"Button handler error: {e}")
         await query.message.reply_text(MESSAGES["error"])
+    finally:
+        state.processing[user_id] = False
 
-# --- Flask Routes ---
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
-    """Handle Telegram webhook updates"""
     if not application:
         return "Bot not ready", 503
-
     try:
-        if not (data := request.get_json(force=True)):
-            return "Empty request", 400
-
-        async_to_sync(application.process_update)(
-            Update.de_json(data, application.bot)
-        )
+        if data := request.get_json(force=True):
+            async_to_sync(application.process_update)(Update.de_json(data, application.bot))
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -393,49 +207,35 @@ def webhook_handler():
 
 @flask_app.route("/health")
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": "1.0.0",
-        "data_status": "loaded" if state.data else "empty",
-        "last_refresh": datetime.fromtimestamp(state.last_refresh).isoformat() if state.last_refresh else None,
         "active_users": len(state.welcomed_users)
     })
 
-# --- Error Handler ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler"""
-    logger.error("Update error:", exc_info=context.error)
-
-# --- Application Startup ---
 async def init_application():
-    """Initialize application"""
     global application
-
+    
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.DEBUG if settings.DEBUG else logging.INFO,
-        datefmt="%Y-%m-%d %H:%M:%S"
+        level=logging.DEBUG if settings.DEBUG else logging.INFO
     )
 
     try:
-        # Initialize bot application
-        application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
+        application = (
+            ApplicationBuilder()
+            .token(settings.BOT_TOKEN)
+            .build()
+        )
 
-        # Add handlers
         application.add_handler(CommandHandler("start", handle_start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                            lambda u, c: u.message.reply_text(MESSAGES["welcome"])))
         application.add_handler(CallbackQueryHandler(handle_button))
-        application.add_error_handler(error_handler)
 
-        # Initialize bot and set webhook
         await application.initialize()
-        webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
-        await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
-
-        # Load initial data
+        await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
         refresh_data()
         return True
 
@@ -444,7 +244,6 @@ async def init_application():
         return False
 
 async def run_application():
-    """Run the application"""
     try:
         if await init_application():
             config = Config()
