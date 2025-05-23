@@ -2,8 +2,8 @@ python-telegram-bot==20.7
 pandas==2.1.4
 pydantic==2.5.2
 pydantic-settings==2.1.0
-flask==3.0.0
+flask[async]==3.0.0
 hypercorn==0.15.0
-tenacity==8.2.3
+openpyxl==3.1.2
 python-dotenv==1.0.0
-openpyxl==3.1.2  # Added for Excel file support
+asgiref==3.7.2
