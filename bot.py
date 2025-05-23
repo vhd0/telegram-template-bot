@@ -19,9 +19,9 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from asgiref.sync import async_to_sync
+import contextlib
 
 class Settings(BaseSettings):
-    """Application settings"""
     BOT_TOKEN: str
     WEBHOOK_URL: str
     PORT: int = Field(default=int(os.getenv('PORT', 8443)))
@@ -34,13 +34,6 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-
-class ExcelData(BaseModel):
-    """Excel data structure"""
-    Key: str
-    Rep1: str
-    Rep2: str
-    Rep3: str
 
 MESSAGES = {
     "welcome": """三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**""",
@@ -56,7 +49,6 @@ MESSAGES = {
 }
 
 class State:
-    """Bot state management"""
     def __init__(self):
         self.data: List[dict] = []
         self.string_ids: Dict[str, int] = {}
@@ -66,6 +58,16 @@ class State:
         self.last_refresh: float = 0
         self._requests: Dict[int, List[float]] = defaultdict(list)
         self.processing: Dict[int, bool] = {}
+        self._loop = None
+
+    def set_loop(self, loop):
+        self._loop = loop
+
+    def get_loop(self):
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        return self._loop
 
     def can_request(self, user_id: int) -> bool:
         now = time.time()
@@ -87,7 +89,6 @@ class State:
     def get_string(self, id: int) -> str:
         return self.id_strings.get(id, '')
 
-# Global instances
 settings = Settings()
 logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
@@ -96,7 +97,6 @@ state = State()
 
 @lru_cache(maxsize=1)
 def load_excel_data() -> List[dict]:
-    """Load Excel data with caching"""
     try:
         df = pd.read_excel(settings.EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         df = df.fillna('')
@@ -106,7 +106,6 @@ def load_excel_data() -> List[dict]:
         return []
 
 def refresh_data() -> None:
-    """Refresh cached data"""
     now = time.time()
     if now - state.last_refresh > settings.CACHE_TTL:
         load_excel_data.cache_clear()
@@ -118,11 +117,20 @@ def refresh_data() -> None:
                     if row[field]:
                         state.get_id(row[field])
 
+async def safe_send_message(func, *args, **kwargs):
+    """Safely execute telegram bot API calls"""
+    for _ in range(3):  # Retry up to 3 times
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"API call failed: {e}")
+            await asyncio.sleep(1)
+    return None
+
 async def send_initial_buttons(update: Update) -> None:
-    """Send initial selection buttons"""
     refresh_data()
     if not state.data:
-        await update.message.reply_text(MESSAGES["no_data"])
+        await safe_send_message(update.message.reply_text, MESSAGES["no_data"])
         return
 
     keyboard = [
@@ -130,18 +138,18 @@ async def send_initial_buttons(update: Update) -> None:
         for key in sorted({row["Key"] for row in state.data if row["Key"]})
     ]
     
-    await update.message.reply_text(
+    await safe_send_message(
+        update.message.reply_text,
         MESSAGES["welcome"],
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
     user_id = update.effective_user.id
     
     if not state.can_request(user_id):
-        await update.message.reply_text(MESSAGES["rate_limit"])
+        await safe_send_message(update.message.reply_text, MESSAGES["rate_limit"])
         return
     
     state.welcomed_users.discard(user_id)
@@ -149,17 +157,16 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state.welcomed_users.add(user_id)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks"""
     query = update.callback_query
     user_id = update.effective_user.id
     
     if not state.can_request(user_id) or state.processing.get(user_id):
-        await query.answer(MESSAGES["processing"])
+        await safe_send_message(query.answer, MESSAGES["processing"])
         return
 
     try:
         state.processing[user_id] = True
-        await query.answer()
+        await safe_send_message(query.answer)
         refresh_data()
 
         level, *ids = query.data.split(':')
@@ -175,7 +182,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if next_rep1:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] 
                           for r1 in sorted(next_rep1)]
-                await query.edit_message_text(
+                await safe_send_message(
+                    query.edit_message_text,
                     f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -186,7 +194,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if next_rep2:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] 
                           for r2 in sorted(next_rep2)]
-                await query.edit_message_text(
+                await safe_send_message(
+                    query.edit_message_text,
                     f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -195,27 +204,34 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             rep3 = next((row["Rep3"] for row in state.data 
                         if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2),
                        MESSAGES["no_data"])
-            await query.edit_message_text(MESSAGES["number"].format(rep3))
-            await query.message.reply_text(
+            await safe_send_message(query.edit_message_text, MESSAGES["number"].format(rep3))
+            await safe_send_message(
+                query.message.reply_text,
                 f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
                 parse_mode='HTML'
             )
 
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await query.message.reply_text(MESSAGES["error"])
+        await safe_send_message(query.message.reply_text, MESSAGES["error"])
     finally:
         state.processing[user_id] = False
 
+async def process_update(update_dict: dict) -> None:
+    """Process update with proper event loop handling"""
+    update = Update.de_json(update_dict, application.bot)
+    await application.process_update(update)
+
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
-    """Handle Telegram webhook updates"""
     if not application:
         return "Bot not ready", 503
 
     try:
         if data := request.get_json(force=True):
-            async_to_sync(application.process_update)(Update.de_json(data, application.bot))
+            loop = state.get_loop()
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(process_update(data))
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -223,7 +239,6 @@ def webhook_handler():
 
 @flask_app.route("/health")
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -232,7 +247,6 @@ def health_check():
     })
 
 async def init_application():
-    """Initialize application"""
     global application
     
     logging.basicConfig(
@@ -254,6 +268,10 @@ async def init_application():
 
         await application.initialize()
         await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
+        
+        # Set initial event loop
+        state.set_loop(asyncio.get_event_loop())
+        
         refresh_data()
         return True
 
@@ -262,7 +280,6 @@ async def init_application():
         return False
 
 async def run_application():
-    """Run the application"""
     try:
         if await init_application():
             config = Config()
