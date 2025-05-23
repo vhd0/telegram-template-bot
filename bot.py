@@ -18,7 +18,6 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# --- CONFIG ---
 class Settings(BaseSettings):
     BOT_TOKEN: str
     WEBHOOK_URL: str
@@ -28,14 +27,13 @@ class Settings(BaseSettings):
     CACHE_TTL: int = Field(default=300)
     WEBHOOK_PATH: str = Field(default="/webhook_telegram")
     DEBUG: bool = Field(default=False)
-
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
 
 settings = Settings()
-CHANNEL_ID = -1002647531334      # ID kênh chat
-ADMIN_ID = 8149389037           # ID admin không kick
+CHANNEL_ID = -1002647531334
+ADMIN_ID = 8149389037
 
 MESSAGES = {
     "welcome": "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**",
@@ -44,13 +42,12 @@ MESSAGES = {
     "selected": "選択されました: {}",
     "instruction": "受け取った番号を、到着の10分前までにこちらのチャンネル <a href='https://t.me/mikami8186lt'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！",
     "wait_time": "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。",
-    "no_data": "申し訳ありませんが、現在データを利用できません。",
+    "no_data": "申し訳ありませんが, hiện tại dữ liệu không khả dụng.",
     "rate_limit": "多くのリクエストを送信しています。しばらくお待ちください。",
     "error": "エラーが発生しました。もう一度お試しください。",
     "number": "あなたの番号: {}"
 }
 
-# --- STATE ---
 class State:
     def __init__(self):
         self.data: List[dict] = []
@@ -85,7 +82,6 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 application = None
 
-# --- DATA LOAD ---
 @lru_cache(maxsize=1)
 def load_excel_data() -> List[dict]:
     try:
@@ -107,7 +103,13 @@ def refresh_data():
                 for field in ["Key", "Rep1", "Rep2"]:
                     if row[field]: state.get_id(row[field])
 
-# --- TELEGRAM BOT HANDLERS ---
+def get_display_name(user):
+    if getattr(user, 'full_name', None) and user.full_name.strip():
+        return user.full_name.strip()
+    if getattr(user, 'username', None):
+        return f"@{user.username}"
+    return str(user.id)
+
 async def safe_send(func, *args, **kwargs):
     try:
         return await func(*args, **kwargs)
@@ -141,7 +143,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
     user_id = user.id
-    username = user.username if user.username else str(user_id)
+    display_name = get_display_name(user)
     if not state.can_request(user_id) or state.processing.get(user_id):
         await safe_send(query.answer, MESSAGES["processing"])
         return
@@ -168,9 +170,25 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif level == "rep2":
             rep3 = next((row["Rep3"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), MESSAGES["no_data"])
             await safe_send(query.edit_message_text, MESSAGES["number"].format(rep3))
-            # Gửi thông báo vào kênh
-            msg = f"@{username} ({user_id}) - {rep3}"
+
+            # Gửi vào kênh với tên khách hàng
+            msg = f"{display_name} - {rep3}"
             await safe_send(context.bot.send_message, chat_id=CHANNEL_ID, text=msg)
+            
+            # Lấy invite link (nếu là private group/channel)
+            invite_link = None
+            try:
+                chat = await context.bot.get_chat(CHANNEL_ID)
+                if hasattr(chat, "invite_link") and chat.invite_link:
+                    invite_link = chat.invite_link
+                else:
+                    invite_link = await context.bot.export_chat_invite_link(CHANNEL_ID)
+            except Exception as e:
+                logger.error(f"Không lấy được invite link: {e}")
+            
+            if invite_link:
+                await safe_send(query.message.reply_text, f"Bạn vui lòng tham gia vào kênh hỗ trợ: {invite_link}")
+
             # Sau 30 phút, kick user khỏi kênh nếu không phải admin
             if user_id != ADMIN_ID:
                 async def delayed_kick():
@@ -188,7 +206,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         state.processing[user_id] = False
 
-# --- FLASK WEBHOOK ---
 def run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -222,7 +239,6 @@ def health_check():
         "active_users": len(state.welcomed_users)
     })
 
-# --- INIT ---
 async def init_application():
     global application
     logging.basicConfig(
