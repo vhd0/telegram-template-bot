@@ -23,6 +23,7 @@ from telegram.ext import (
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
+from asgiref.sync import async_to_sync
 
 # --- Settings Management ---
 class Settings(BaseSettings):
@@ -342,7 +343,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- Flask Routes ---
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
-async def webhook_handler():
+def webhook_handler():
     """Handle Telegram webhook updates"""
     if not application:
         return "Bot not ready", 503
@@ -351,7 +352,7 @@ async def webhook_handler():
         if not (data := request.get_json(force=True)):
             return "Empty request", 400
 
-        await application.process_update(
+        async_to_sync(application.process_update)(
             Update.de_json(data, application.bot)
         )
         return "ok", 200
