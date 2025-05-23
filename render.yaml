@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # Không sync với GitHub
+      - key: WEBHOOK_URL
+        sync: false
+      - key: PORT
+        value: 8443
+      - key: EXCEL_FILE_PATH
+        value: rep.xlsx
+      - key: MAX_REQUESTS_PER_MINUTE
+        value: 30
+      - key: CACHE_TTL
+        value: 300
