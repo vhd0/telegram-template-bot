@@ -19,7 +19,6 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from asgiref.sync import async_to_sync
-import contextlib
 
 class Settings(BaseSettings):
     BOT_TOKEN: str
@@ -45,7 +44,7 @@ MESSAGES = {
     "no_data": "申し訳ありませんが、現在データを利用できません。",
     "rate_limit": "多くのリクエストを送信しています。しばらくお待ちください。",
     "error": "エラーが発生しました。もう一度お試しください。",
-    "number": "あなたの番号: {}"
+    "number": "{}"
 }
 
 class State:
@@ -58,16 +57,6 @@ class State:
         self.last_refresh: float = 0
         self._requests: Dict[int, List[float]] = defaultdict(list)
         self.processing: Dict[int, bool] = {}
-        self._loop = None
-
-    def set_loop(self, loop):
-        self._loop = loop
-
-    def get_loop(self):
-        if self._loop is None or self._loop.is_closed():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-        return self._loop
 
     def can_request(self, user_id: int) -> bool:
         now = time.time()
@@ -119,13 +108,18 @@ def refresh_data() -> None:
 
 async def safe_send_message(func, *args, **kwargs):
     """Safely execute telegram bot API calls"""
-    for _ in range(3):  # Retry up to 3 times
+    max_retries = 3
+    retry_delay = 1
+
+    for attempt in range(max_retries):
         try:
             return await func(*args, **kwargs)
         except Exception as e:
-            logger.warning(f"API call failed: {e}")
-            await asyncio.sleep(1)
-    return None
+            if attempt == max_retries - 1:
+                logger.error(f"Failed after {max_retries} attempts: {e}")
+                raise
+            logger.warning(f"Attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(retry_delay)
 
 async def send_initial_buttons(update: Update) -> None:
     refresh_data()
@@ -219,19 +213,30 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def process_update(update_dict: dict) -> None:
     """Process update with proper event loop handling"""
-    update = Update.de_json(update_dict, application.bot)
-    await application.process_update(update)
+    try:
+        update = Update.de_json(update_dict, application.bot)
+        await application.process_update(update)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+
+def run_async(coro):
+    """Run coroutine in the event loop"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
+    """Handle Telegram webhook updates"""
     if not application:
         return "Bot not ready", 503
 
     try:
         if data := request.get_json(force=True):
-            loop = state.get_loop()
-            with contextlib.suppress(Exception):
-                loop.run_until_complete(process_update(data))
+            run_async(process_update(data))
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -247,6 +252,7 @@ def health_check():
     })
 
 async def init_application():
+    """Initialize application"""
     global application
     
     logging.basicConfig(
@@ -258,6 +264,7 @@ async def init_application():
         application = (
             ApplicationBuilder()
             .token(settings.BOT_TOKEN)
+            .concurrent_updates(True)
             .build()
         )
 
@@ -268,10 +275,6 @@ async def init_application():
 
         await application.initialize()
         await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
-        
-        # Set initial event loop
-        state.set_loop(asyncio.get_event_loop())
-        
         refresh_data()
         return True
 
@@ -280,6 +283,7 @@ async def init_application():
         return False
 
 async def run_application():
+    """Run the application"""
     try:
         if await init_application():
             config = Config()
