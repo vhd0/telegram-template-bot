@@ -36,16 +36,16 @@ CHANNEL_ID = -1002647531334
 ADMIN_ID = 8149389037
 
 MESSAGES = {
-    "welcome": "三上はじめにへようこそ。以下の選択肢からお選びください。\n\n**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**",
-    "processing": "⏳ 処理中です...",
-    "next_step": "次に進んでください:",
-    "selected": "選択されました: {}",
-    "instruction": "受け取った番号を、到着の10分前までにこちらのチャンネル <a href='https://t.me/mikami8186lt'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！",
-    "wait_time": "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。",
-    "no_data": "申し訳ありませんが, hiện tại dữ liệu không khả dụng.",
-    "rate_limit": "多くのリクエストを送信しています。しばらくお待ちください。",
-    "error": "エラーが発生しました。もう一度お試しください。",
-    "number": "あなたの番号: {}"
+    "welcome": "三上はじめにへようこそ。下記の選択肢からご希望の項目をお選びください。\n\n※ボタンを押した後、処理に数秒かかる場合がございます。しばらくお待ちいただくか、反応がない場合は再度ボタンを押してください。ご協力ありがとうございます。",
+    "processing": "⏳ 只今処理中です。しばらくお待ちください。",
+    "next_step": "次の項目をお選びください。",
+    "selected": "選択された項目：{}",
+    "instruction": "受け取った番号を、到着の10分前までに下記のチャンネル <a href='https://t.me/mikami8186lt'>Telegramチャネル</a> へご送信ください。何卒よろしくお願いいたします。",
+    "wait_time": "通常、5分以内にお部屋番号をご案内いたしますが、担当者が対応中の場合30分以上お待ちいただくことがございます。誠に恐れ入りますが、今しばらくお待ちくださいませ。",
+    "no_data": "申し訳ございませんが、現在ご利用いただけるデータがありません。",
+    "rate_limit": "リクエストが多すぎます。しばらく時間をおいてから再度お試しください。",
+    "error": "エラーが発生しました。お手数ですが、もう一度お試しください。",
+    "number": "お客様の番号：{}"
 }
 
 class State:
@@ -110,6 +110,9 @@ def get_display_name(user):
         return f"@{user.username}"
     return str(user.id)
 
+def get_tag(user):
+    return f"@{user.username}" if user.username else f"<a href='tg://user?id={user.id}'>user</a>"
+
 async def safe_send(func, *args, **kwargs):
     try:
         return await func(*args, **kwargs)
@@ -144,6 +147,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     display_name = get_display_name(user)
+    tag = get_tag(user)
     if not state.can_request(user_id) or state.processing.get(user_id):
         await safe_send(query.answer, MESSAGES["processing"])
         return
@@ -171,25 +175,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rep3 = next((row["Rep3"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), MESSAGES["no_data"])
             await safe_send(query.edit_message_text, MESSAGES["number"].format(rep3))
 
-            # Gửi vào kênh với tên khách hàng
-            msg = f"{display_name} - {rep3}"
-            await safe_send(context.bot.send_message, chat_id=CHANNEL_ID, text=msg)
+            # メッセージ例: 山田太郎 (@yamada) - 12345
+            msg = f"{display_name}（{tag}） - {rep3}"
+            await safe_send(context.bot.send_message, chat_id=CHANNEL_ID, text=msg, parse_mode='HTML')
             
-            # Lấy invite link (nếu là private group/channel)
-            invite_link = None
-            try:
-                chat = await context.bot.get_chat(CHANNEL_ID)
-                if hasattr(chat, "invite_link") and chat.invite_link:
-                    invite_link = chat.invite_link
-                else:
-                    invite_link = await context.bot.export_chat_invite_link(CHANNEL_ID)
-            except Exception as e:
-                logger.error(f"Không lấy được invite link: {e}")
-            
-            if invite_link:
-                await safe_send(query.message.reply_text, f"Bạn vui lòng tham gia vào kênh hỗ trợ: {invite_link}")
-
-            # Sau 30 phút, kick user khỏi kênh nếu không phải admin
+            # 30分後に自動で退出（管理者以外）
             if user_id != ADMIN_ID:
                 async def delayed_kick():
                     await asyncio.sleep(30 * 60)
