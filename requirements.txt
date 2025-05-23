@@ -1,6 +1,7 @@
 python-telegram-bot==20.7
 pandas==2.1.4
 pydantic==2.5.2
+pydantic-settings==2.1.0  # Added this
 flask==3.0.0
 hypercorn==0.15.0
 tenacity==8.2.3
