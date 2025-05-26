@@ -266,21 +266,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
 
 # ----- APP SETUP -----
-def run_async(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
-def webhook_handler():
-    if not application: return "Bot not ready", 503
+async def webhook_handler():
+    if not application:
+        return "Bot not ready", 503
     try:
         data = request.get_json(force=True)
         if data:
-            run_async(process_update(data))
+            await process_update(data)
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
