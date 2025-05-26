@@ -216,22 +216,26 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
-    logger.info(f"Callback from user {user_id} data: {query.data}")
     data = query.data or ""
     if not data.startswith("time:"):
         return
     time_value = data[5:]
     await safe_send_and_track(query.answer, update)
     if user_id not in state.waiting_time_input:
-        logger.warning(f"user_id {user_id} not in waiting_time_input")
         await safe_send_and_track(
             query.edit_message_text, update,
             "再度最初からご選択ください。"
         )
         return
     if time_value == "other":
+        # Xóa message cũ có bàn phím inline để tránh lỗi
+        try:
+            await context.bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
+        except Exception:
+            pass
+        # Gửi message mới có ForceReply
         await safe_send_and_track(
-            query.edit_message_text, update,
+            update.effective_chat.send_message, update,
             MESSAGES["ask_manual_time"],
             reply_markup=ForceReply(selective=True)
         )
