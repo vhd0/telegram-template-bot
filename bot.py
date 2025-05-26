@@ -54,10 +54,10 @@ class State:
         self.string_ids: Dict[str, int] = {}
         self.id_strings: Dict[int, str] = {}
         self.next_id = 0
-        self.welcomed_users: Set[int] = set()
         self.last_refresh = 0
         self._requests = defaultdict(list)
         self.processing = {}
+        self.user_message_ids = defaultdict(list)
 
     def can_request(self, user_id: int) -> bool:
         now = time.time()
@@ -113,21 +113,36 @@ def get_display_name(user):
 def get_tag(user):
     return f"@{user.username}" if user.username else f"<a href='tg://user?id={user.id}'>user</a>"
 
-async def safe_send(func, *args, **kwargs):
+async def safe_send_and_track(func, update, *args, **kwargs):
     try:
-        return await func(*args, **kwargs)
+        sent_msg = await func(*args, **kwargs)
+        if sent_msg and hasattr(sent_msg, 'message_id'):
+            user_id = update.effective_user.id
+            state.user_message_ids[user_id].append(sent_msg.message_id)
+        return sent_msg
     except Exception as e:
         logger.warning(f"Send error: {e}")
 
-async def send_initial_buttons(update: Update):
+async def delete_user_messages(update, context):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    for msg_id in state.user_message_ids[user_id]:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+    state.user_message_ids[user_id].clear()
+
+async def send_initial_buttons(update: Update, context=None):
     refresh_data()
     if not state.data:
-        await safe_send(update.message.reply_text, MESSAGES["no_data"])
+        await safe_send_and_track(update.message.reply_text, update, MESSAGES["no_data"])
         return
     keys = sorted({row["Key"] for row in state.data if row["Key"]})
     keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
-    await safe_send(
+    await safe_send_and_track(
         update.message.reply_text,
+        update,
         MESSAGES["welcome"],
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
@@ -136,11 +151,11 @@ async def send_initial_buttons(update: Update):
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not state.can_request(user_id):
-        await safe_send(update.message.reply_text, MESSAGES["rate_limit"])
+        await safe_send_and_track(update.message.reply_text, update, MESSAGES["rate_limit"])
         return
-    state.welcomed_users.discard(user_id)
-    await send_initial_buttons(update)
-    state.welcomed_users.add(user_id)
+    state.processing[user_id] = False
+    await delete_user_messages(update, context)
+    await send_initial_buttons(update, context)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -149,11 +164,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_name = get_display_name(user)
     tag = get_tag(user)
     if not state.can_request(user_id) or state.processing.get(user_id):
-        await safe_send(query.answer, MESSAGES["processing"])
+        await safe_send_and_track(query.answer, update, MESSAGES["processing"])
         return
     try:
         state.processing[user_id] = True
-        await safe_send(query.answer)
+        await safe_send_and_track(query.answer, update)
         refresh_data()
         level, *ids = query.data.split(':')
         ids = [int(i) if i else -1 for i in ids]
@@ -165,21 +180,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
             if rep1s:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
-                await safe_send(query.edit_message_text, f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
+                await safe_send_and_track(query.edit_message_text, update, f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
         elif level == "rep1":
             rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
-                await safe_send(query.edit_message_text, f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
+                await safe_send_and_track(query.edit_message_text, update, f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
         elif level == "rep2":
             rep3 = next((row["Rep3"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), MESSAGES["no_data"])
-            await safe_send(query.edit_message_text, MESSAGES["number"].format(rep3))
-
-            # メッセージ例: 山田太郎 (@yamada) - 12345
+            await safe_send_and_track(query.edit_message_text, update, MESSAGES["number"].format(rep3))
             msg = f"{display_name}（{tag}） - {rep3}"
-            await safe_send(context.bot.send_message, chat_id=CHANNEL_ID, text=msg, parse_mode='HTML')
-            
-            # 30分後に自動で退出（管理者以外）
+            await safe_send_and_track(context.bot.send_message, update, chat_id=CHANNEL_ID, text=msg, parse_mode='HTML')
             if user_id != ADMIN_ID:
                 async def delayed_kick():
                     await asyncio.sleep(30 * 60)
@@ -189,10 +200,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.error(f"Kick user error: {e}")
                 asyncio.create_task(delayed_kick())
-            await safe_send(query.message.reply_text, f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}", parse_mode='HTML')
+            await safe_send_and_track(query.message.reply_text, update, f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}", parse_mode='HTML')
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await safe_send(query.message.reply_text, MESSAGES["error"])
+        await safe_send_and_track(query.message.reply_text, update, MESSAGES["error"])
     finally:
         state.processing[user_id] = False
 
@@ -225,8 +236,7 @@ def health_check():
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "1.0.0",
-        "active_users": len(state.welcomed_users)
+        "version": "1.0.0"
     })
 
 async def init_application():
