@@ -4,7 +4,6 @@ import asyncio
 import pandas as pd
 import time
 from collections import defaultdict
-from typing import Dict, List
 from functools import lru_cache
 from datetime import datetime, timezone
 from pydantic_settings import BaseSettings
@@ -18,6 +17,7 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
+# ----- CONFIGURATION -----
 class Settings(BaseSettings):
     BOT_TOKEN: str
     WEBHOOK_URL: str
@@ -30,10 +30,8 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-
 settings = Settings()
 CHANNEL_ID = -1002647531334
-ADMIN_ID = 8149389037
 
 MESSAGES = {
     "welcome": (
@@ -41,16 +39,15 @@ MESSAGES = {
         "下記の選択肢よりご希望の項目をお選びください。\n\n"
         "※ボタンを押した後、処理に数秒かかる場合がございます。反応がない場合は再度お試しください。"
     ),
-    "processing": "⏳ 現在処理中です。しばらくお待ちいただきますようお願い申し上げます。",
+    "processing": "⏳ 現在処理中です。しばらくお待ちください。",
     "next_step": "次の項目をお選びください。",
     "selected": "ご選択いただいた項目：{}",
     "no_data": "申し訳ございませんが、現在ご案内可能なデータがございません。",
     "rate_limit": "リクエストが多すぎます。しばらく経ってから再度お試しください。",
     "error": "エラーが発生しました。お手数ですが、もう一度お試しください。",
-    "number": "お客様の番号：{}",
     "ask_time": (
         "お客様の番号：<b>{}</b>\n\n"
-        "ご到着予定時刻をお知らせいただけますでしょうか。（下記よりお選びいただくか、「その他」の場合はご入力ください）"
+        "ご到着予定時刻をお知らせください。（下記より選択、または「その他」の場合はご入力ください）"
     ),
     "ask_manual_time": "ご到着予定時刻を「HH:MM」形式でご入力くださいませ。",
     "final_thanks": (
@@ -60,17 +57,18 @@ MESSAGES = {
     )
 }
 
+# ----- STATE -----
 class State:
     def __init__(self):
-        self.data: list = []
-        self.string_ids: Dict[str, int] = {}
-        self.id_strings: Dict[int, str] = {}
+        self.data = []
+        self.string_ids = {}
+        self.id_strings = {}
         self.next_id = 0
         self.last_refresh = 0
         self._requests = defaultdict(list)
         self.processing = {}
         self.user_message_ids = defaultdict(list)
-        self.waiting_time_input = {}   # user_id: {'rep3': ..., 'name': ...}
+        self.waiting_time_input = {}
 
     def can_request(self, user_id: int) -> bool:
         now = time.time()
@@ -86,7 +84,6 @@ class State:
             self.id_strings[self.next_id] = s
             self.next_id += 1
         return self.string_ids[s]
-
     def get_string(self, i: int) -> str:
         return self.id_strings.get(i, '')
 
@@ -95,8 +92,9 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 application = None
 
+# ----- DATA -----
 @lru_cache(maxsize=1)
-def load_excel_data() -> list:
+def load_excel_data():
     try:
         df = pd.read_excel(settings.EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         df = df.fillna('')
@@ -109,7 +107,8 @@ def refresh_data():
     now = time.time()
     if now - state.last_refresh > settings.CACHE_TTL:
         load_excel_data.cache_clear()
-        if data := load_excel_data():
+        data = load_excel_data()
+        if data:
             state.data = data
             state.last_refresh = now
             for row in data:
@@ -119,6 +118,7 @@ def refresh_data():
 def get_display_name(user):
     return (user.full_name or user.username or str(user.id)).strip()
 
+# ----- BOT UTIL -----
 async def safe_send_and_track(func, update, *args, **kwargs):
     try:
         sent_msg = await func(*args, **kwargs)
@@ -139,6 +139,7 @@ async def delete_user_messages(update, context):
             pass
     state.user_message_ids[user_id].clear()
 
+# ----- BOT HANDLERS -----
 async def send_initial_buttons(update: Update, context=None):
     refresh_data()
     if not state.data:
@@ -215,11 +216,19 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+    logger.info(f"Callback from user {user_id} data: {query.data}")
     data = query.data or ""
     if not data.startswith("time:"):
         return
     time_value = data[5:]
     await safe_send_and_track(query.answer, update)
+    if user_id not in state.waiting_time_input:
+        logger.warning(f"user_id {user_id} not in waiting_time_input")
+        await safe_send_and_track(
+            query.edit_message_text, update,
+            "再度最初からご選択ください。"
+        )
+        return
     if time_value == "other":
         await safe_send_and_track(
             query.edit_message_text, update,
@@ -232,8 +241,6 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    logger.info(f"Received manual time from user {user_id}: {update.message.text}")
-    logger.info(f"State for this user: {state.waiting_time_input.get(user_id)}")
     if (
         user_id in state.waiting_time_input and 
         state.waiting_time_input[user_id].get("waiting_manual_time")
@@ -247,15 +254,14 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
-    name = info["name"]
-    rep3 = info["rep3"]
-    msg = f"{name} - {rep3} - {time_value}"
+    msg = f"{info['name']} - {info['rep3']} - {time_value}"
     await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
     await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
 
+# ----- APP SETUP -----
 def run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
