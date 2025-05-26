@@ -14,14 +14,7 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# --- LOGGING SETUP ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# --- CONFIG ---
+# --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8443))
@@ -52,7 +45,10 @@ MESSAGES = {
     )
 }
 
-# --- STATE ---
+# --- Setup ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class State:
     def __init__(self):
         self.data = []
@@ -89,7 +85,7 @@ state = State()
 app = Flask(__name__)
 application = None
 
-# --- DATA MANAGEMENT ---
+# --- Data Management ---
 @lru_cache(maxsize=1)
 def load_excel_data():
     try:
@@ -111,24 +107,18 @@ def refresh_data():
                     if row[field]:
                         state.get_id(row[field])
 
-# --- MESSAGE HANDLING ---
-async def safe_message_send(send_func, *args, **kwargs):
+# --- Message Handling ---
+async def send_message(update, message_func, text, **kwargs):
     try:
-        return await send_func(*args, **kwargs)
+        msg = await message_func(text=text, **kwargs)
+        if msg and hasattr(msg, 'message_id'):
+            state.user_message_ids[update.effective_user.id].append(msg.message_id)
+        return msg
     except Exception as e:
-        logger.error(f"Message send error: {e}")
+        logger.error(f"Message error: {e}")
         return None
 
-async def track_message(update, message):
-    if message and hasattr(message, 'message_id'):
-        state.user_message_ids[update.effective_user.id].append(message.message_id)
-    return message
-
-async def safe_send_and_track(func, update, *args, **kwargs):
-    message = await safe_message_send(func, *args, **kwargs)
-    return await track_message(update, message)
-
-async def delete_user_messages(update, context):
+async def delete_messages(update, context):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     for msg_id in state.user_message_ids[user_id]:
@@ -138,17 +128,17 @@ async def delete_user_messages(update, context):
             pass
     state.user_message_ids[user_id].clear()
 
-# --- HANDLERS ---
+# --- Handlers ---
 async def send_initial_buttons(update: Update):
     refresh_data()
     if not state.data:
-        return await safe_send_and_track(update.message.reply_text, update, MESSAGES["no_data"])
+        return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
     
     keys = sorted({row["Key"] for row in state.data if row["Key"]})
     keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
-    await safe_send_and_track(
-        update.message.reply_text,
+    await send_message(
         update,
+        update.message.reply_text,
         MESSAGES["welcome"],
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='HTML'
@@ -157,11 +147,11 @@ async def send_initial_buttons(update: Update):
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not state.can_request(user_id):
-        return await safe_send_and_track(update.message.reply_text, update, MESSAGES["rate_limit"])
+        return await send_message(update, update.message.reply_text, MESSAGES["rate_limit"])
     
     state.processing[user_id] = False
     state.waiting_time_input.pop(user_id, None)
-    await delete_user_messages(update, context)
+    await delete_messages(update, context)
     await send_initial_buttons(update)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,7 +159,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if not state.can_request(user_id) or state.processing.get(user_id):
-        return await safe_send_and_track(query.answer, update, MESSAGES["processing"])
+        return await query.answer(MESSAGES["processing"])
 
     try:
         state.processing[user_id] = True
@@ -188,9 +178,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
             if rep1s:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
-                await safe_send_and_track(
-                    query.edit_message_text,
+                await send_message(
                     update,
+                    query.edit_message_text,
                     f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -199,9 +189,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
-                await safe_send_and_track(
-                    query.edit_message_text,
+                await send_message(
                     update,
+                    query.edit_message_text,
                     f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
@@ -223,19 +213,19 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
                 ]
                 keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
-                await safe_send_and_track(
-                    query.edit_message_text,
+                await send_message(
                     update,
+                    query.edit_message_text,
                     MESSAGES["ask_time"],
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
                 )
             else:
-                await safe_send_and_track(query.edit_message_text, update, MESSAGES["no_data"])
+                await send_message(update, query.edit_message_text, MESSAGES["no_data"])
     
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await safe_send_and_track(query.message.reply_text, update, MESSAGES["error"])
+        await send_message(update, query.message.reply_text, MESSAGES["error"])
     
     finally:
         state.processing[user_id] = False
@@ -250,20 +240,17 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     if user_id not in state.waiting_time_input:
-        return await safe_send_and_track(query.edit_message_text, update, "再度最初からご選択ください。")
+        return await send_message(update, query.edit_message_text, "再度最初からご選択ください。")
     
     if time_value == "other":
         try:
-            await context.bot.delete_message(
-                chat_id=query.message.chat.id,
-                message_id=query.message.message_id
-            )
+            await context.bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
         except Exception:
             pass
         
-        await safe_send_and_track(
-            update.effective_chat.send_message,
+        await send_message(
             update,
+            update.effective_chat.send_message,
             MESSAGES["ask_manual_time"],
             reply_markup=ForceReply(selective=True)
         )
@@ -290,21 +277,23 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     )
     
     msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
-    await safe_message_send(
-        context.bot.send_message,
-        chat_id=CHANNEL_ID,
-        text=msg,
-        parse_mode='HTML'
-    )
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=msg,
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Channel message error: {e}")
     
-    await safe_send_and_track(
-        update.effective_message.reply_text,
+    await send_message(
         update,
+        update.effective_message.reply_text,
         MESSAGES["final_thanks"],
         parse_mode='HTML'
     )
 
-# --- WEBHOOK ---
+# --- Webhook ---
 @app.route(WEBHOOK_PATH, methods=["POST"])
 async def webhook_handler():
     if not application:
@@ -327,7 +316,7 @@ def health_check():
         "version": "1.0.0"
     })
 
-# --- INITIALIZATION ---
+# --- Init ---
 async def init_bot():
     global application
     try:
@@ -351,6 +340,7 @@ async def init_bot():
         logger.error(f"Bot initialization error: {e}")
         return False
 
+# --- Main ---
 if __name__ == '__main__':
     try:
         config = Config()
@@ -359,11 +349,9 @@ if __name__ == '__main__':
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Initialize bot first
         if not loop.run_until_complete(init_bot()):
             raise RuntimeError("Failed to initialize bot")
             
-        # Then run web server
         loop.run_until_complete(serve(app, config))
         
     except KeyboardInterrupt:
