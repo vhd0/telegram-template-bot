@@ -36,21 +36,33 @@ CHANNEL_ID = -1002647531334
 ADMIN_ID = 8149389037
 
 MESSAGES = {
-    "welcome": "三上はじめにへようこそ。下記の選択肢からご希望の項目をお選びください。\n\n※ボタンを押した後、処理に数秒かかる場合がございます。しばらくお待ちいただくか、反応がない場合は再度ボタンを押してください。ご協力ありがとうございます。",
-    "processing": "⏳ 只今処理中です。しばらくお待ちください。",
+    "welcome": (
+        "三上はじめにようこそお越しくださいました。ご利用いただき、誠にありがとうございます。\n"
+        "下記の選択肢よりご希望の項目をお選びください。\n\n"
+        "※ボタンを押した後、処理に数秒かかる場合がございます。反応がない場合は再度お試しください。"
+    ),
+    "processing": "⏳ 現在処理中です。しばらくお待ちいただきますようお願い申し上げます。",
     "next_step": "次の項目をお選びください。",
-    "selected": "選択された項目：{}",
-    "instruction": "受け取った番号を、到着の10分前までに下記のチャンネル <a href='https://t.me/mikami8186lt'>Telegramチャネル</a> へご送信ください。何卒よろしくお願いいたします。",
-    "wait_time": "通常、5分以内にお部屋番号をご案内いたしますが、担当者が対応中の場合30分以上お待ちいただくことがございます。誠に恐れ入りますが、今しばらくお待ちくださいませ。",
-    "no_data": "申し訳ございませんが、現在ご利用いただけるデータがありません。",
-    "rate_limit": "リクエストが多すぎます。しばらく時間をおいてから再度お試しください。",
+    "selected": "ご選択いただいた項目：{}",
+    "no_data": "申し訳ございませんが、現在ご案内可能なデータがございません。",
+    "rate_limit": "リクエストが多すぎます。しばらく経ってから再度お試しください。",
     "error": "エラーが発生しました。お手数ですが、もう一度お試しください。",
-    "number": "お客様の番号：{}"
+    "number": "お客様の番号：{}",
+    "ask_time": (
+        "お客様の番号：<b>{}</b>\n\n"
+        "ご到着予定時刻をお知らせいただけますでしょうか。（下記よりお選びいただくか、「その他」の場合はご入力ください）"
+    ),
+    "ask_manual_time": "ご到着予定時刻を「HH:MM」形式でご入力くださいませ。",
+    "final_thanks": (
+        "ご入力いただき、誠にありがとうございます。\n"
+        "お客様のご到着を心よりお待ち申し上げております。\n"
+        "ご不明点がございましたらお気軽にご連絡くださいませ。"
+    )
 }
 
 class State:
     def __init__(self):
-        self.data: List[dict] = []
+        self.data: list = []
         self.string_ids: Dict[str, int] = {}
         self.id_strings: Dict[int, str] = {}
         self.next_id = 0
@@ -58,6 +70,7 @@ class State:
         self._requests = defaultdict(list)
         self.processing = {}
         self.user_message_ids = defaultdict(list)
+        self.waiting_time_input = {}   # user_id: {'rep3': ..., 'name': ...}
 
     def can_request(self, user_id: int) -> bool:
         now = time.time()
@@ -83,7 +96,7 @@ flask_app = Flask(__name__)
 application = None
 
 @lru_cache(maxsize=1)
-def load_excel_data() -> List[dict]:
+def load_excel_data() -> list:
     try:
         df = pd.read_excel(settings.EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         df = df.fillna('')
@@ -104,14 +117,7 @@ def refresh_data():
                     if row[field]: state.get_id(row[field])
 
 def get_display_name(user):
-    if getattr(user, 'full_name', None) and user.full_name.strip():
-        return user.full_name.strip()
-    if getattr(user, 'username', None):
-        return f"@{user.username}"
-    return str(user.id)
-
-def get_tag(user):
-    return f"@{user.username}" if user.username else f"<a href='tg://user?id={user.id}'>user</a>"
+    return (user.full_name or user.username or str(user.id)).strip()
 
 async def safe_send_and_track(func, update, *args, **kwargs):
     try:
@@ -145,7 +151,7 @@ async def send_initial_buttons(update: Update, context=None):
         update,
         MESSAGES["welcome"],
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,6 +160,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send_and_track(update.message.reply_text, update, MESSAGES["rate_limit"])
         return
     state.processing[user_id] = False
+    state.waiting_time_input.pop(user_id, None)
     await delete_user_messages(update, context)
     await send_initial_buttons(update, context)
 
@@ -161,8 +168,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
     user_id = user.id
-    display_name = get_display_name(user)
-    tag = get_tag(user)
     if not state.can_request(user_id) or state.processing.get(user_id):
         await safe_send_and_track(query.answer, update, MESSAGES["processing"])
         return
@@ -188,24 +193,57 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_send_and_track(query.edit_message_text, update, f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
         elif level == "rep2":
             rep3 = next((row["Rep3"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), MESSAGES["no_data"])
-            await safe_send_and_track(query.edit_message_text, update, MESSAGES["number"].format(rep3))
-            msg = f"{display_name}（{tag}） - {rep3}"
-            await safe_send_and_track(context.bot.send_message, update, chat_id=CHANNEL_ID, text=msg, parse_mode='HTML')
-            if user_id != ADMIN_ID:
-                async def delayed_kick():
-                    await asyncio.sleep(30 * 60)
-                    try:
-                        await context.bot.ban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-                        await context.bot.unban_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-                    except Exception as e:
-                        logger.error(f"Kick user error: {e}")
-                asyncio.create_task(delayed_kick())
-            await safe_send_and_track(query.message.reply_text, update, f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}", parse_mode='HTML')
+            state.waiting_time_input[user_id] = {'rep3': rep3, 'name': get_display_name(user)}
+            times = [
+                ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
+                ("12:00", "12:00"), ("14:00", "14:00"), ("16:00", "16:00"),
+                ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
+            ]
+            keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
+            await safe_send_and_track(
+                query.edit_message_text, update,
+                MESSAGES["ask_time"].format(rep3),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
     except Exception as e:
         logger.error(f"Button handler error: {e}")
         await safe_send_and_track(query.message.reply_text, update, MESSAGES["error"])
     finally:
         state.processing[user_id] = False
+
+async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    data = query.data or ""
+    if not data.startswith("time:"):
+        return
+    time_value = data[5:]
+    await safe_send_and_track(query.answer, update)
+    if time_value == "other":
+        sent = await safe_send_and_track(
+            query.edit_message_text, update,
+            MESSAGES["ask_manual_time"]
+        )
+        state.waiting_time_input[user_id]["waiting_manual_time"] = True
+    else:
+        await send_to_channel_and_finish(update, context, user_id, time_value)
+
+async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in state.waiting_time_input and state.waiting_time_input[user_id].get("waiting_manual_time"):
+        time_value = update.message.text.strip()
+        await send_to_channel_and_finish(update, context, user_id, time_value)
+        state.waiting_time_input[user_id].pop("waiting_manual_time", None)
+
+async def send_to_channel_and_finish(update, context, user_id, time_value):
+    info = state.waiting_time_input.pop(user_id, None)
+    if not info: return
+    name = info["name"]
+    rep3 = info["rep3"]
+    msg = f"{name} - {rep3} - {time_value}"
+    await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
+    await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
 
 def run_async(coro):
     loop = asyncio.new_event_loop()
@@ -253,7 +291,8 @@ async def init_application():
             .build()
         )
         application.add_handler(CommandHandler("start", handle_start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: u.message.reply_text(MESSAGES["welcome"])))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_time))
+        application.add_handler(CallbackQueryHandler(handle_time_select, pattern="^time:"))
         application.add_handler(CallbackQueryHandler(handle_button))
         await application.initialize()
         await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
