@@ -17,7 +17,7 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# ----- CONFIGURATION -----
+# --- CONFIGURATION ---
 class Settings(BaseSettings):
     BOT_TOKEN: str
     WEBHOOK_URL: str
@@ -57,7 +57,7 @@ MESSAGES = {
     )
 }
 
-# ----- STATE -----
+# --- STATE ---
 class State:
     def __init__(self):
         self.data = []
@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 application = None
 
-# ----- DATA -----
+# --- DATA LOADING ---
 @lru_cache(maxsize=1)
 def load_excel_data():
     try:
@@ -118,7 +118,7 @@ def refresh_data():
 def get_display_name(user):
     return (user.full_name or user.username or str(user.id)).strip()
 
-# ----- BOT UTIL -----
+# --- BOT UTILITIES ---
 async def safe_send_and_track(func, update, *args, **kwargs):
     try:
         sent_msg = await func(*args, **kwargs)
@@ -139,7 +139,7 @@ async def delete_user_messages(update, context):
             pass
     state.user_message_ids[user_id].clear()
 
-# ----- BOT HANDLERS -----
+# --- BOT HANDLERS ---
 async def send_initial_buttons(update: Update, context=None):
     refresh_data()
     if not state.data:
@@ -193,8 +193,18 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
                 await safe_send_and_track(query.edit_message_text, update, f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}", reply_markup=InlineKeyboardMarkup(keyboard))
         elif level == "rep2":
-            rep3 = next((row["Rep3"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), MESSAGES["no_data"])
-            state.waiting_time_input[user_id] = {'rep3': rep3, 'name': get_display_name(user)}
+            row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
+            if row:
+                rep3 = row.get("Rep3", "")
+                rep4 = row.get("Rep4", "")
+            else:
+                rep3, rep4 = MESSAGES["no_data"], ""
+            state.waiting_time_input[user_id] = {
+                'rep3': rep3,
+                'rep4': rep4,
+                'name': get_display_name(user),
+                'user_id': user.id
+            }
             times = [
                 ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
                 ("12:00", "12:00"), ("14:00", "14:00"), ("16:00", "16:00"),
@@ -228,12 +238,10 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
     if time_value == "other":
-        # Xóa message cũ có bàn phím inline để tránh lỗi
         try:
             await context.bot.delete_message(chat_id=query.message.chat.id, message_id=query.message.message_id)
         except Exception:
             pass
-        # Gửi message mới có ForceReply
         await safe_send_and_track(
             update.effective_chat.send_message, update,
             MESSAGES["ask_manual_time"],
@@ -258,14 +266,15 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
-    msg = f"{info['name']} - {info['rep3']} - {time_value}"
+    # --- Cấu trúc mới ---
+    msg = f"{info['rep3']} - {info['rep4']} - {info['name']} @{info['user_id']} - {time_value}"
     await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
     await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
 
-# ----- APP SETUP -----
+# --- APP SETUP ---
 @flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
 async def webhook_handler():
     if not application:
