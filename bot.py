@@ -5,33 +5,24 @@ import pandas as pd
 import time
 from collections import defaultdict
 from functools import lru_cache
-from datetime import datetime, timezone
-from pydantic_settings import BaseSettings
-from pydantic import Field
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters, CallbackQueryHandler
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
-# --- CONFIGURATION ---
-class Settings(BaseSettings):
-    BOT_TOKEN: str
-    WEBHOOK_URL: str
-    PORT: int = Field(default=int(os.getenv('PORT', 8443)))
-    EXCEL_FILE_PATH: str = Field(default="rep.xlsx")
-    MAX_REQUESTS_PER_MINUTE: int = Field(default=30)
-    CACHE_TTL: int = Field(default=300)
-    WEBHOOK_PATH: str = Field(default="/webhook_telegram")
-    DEBUG: bool = Field(default=False)
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-settings = Settings()
-CHANNEL_ID = -1002647531334
+# --- CONFIG ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 8443))
+EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
+MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", 30))
+CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
+WEBHOOK_PATH = "/webhook_telegram"
+CHANNEL_ID = -1002647531334  # Thay bằng channel id của bạn
 
 MESSAGES = {
     "welcome": (
@@ -73,7 +64,7 @@ class State:
     def can_request(self, user_id: int) -> bool:
         now = time.time()
         req = self._requests[user_id] = [r for r in self._requests[user_id] if now - r < 60]
-        if len(req) >= settings.MAX_REQUESTS_PER_MINUTE: return False
+        if len(req) >= MAX_REQUESTS_PER_MINUTE: return False
         req.append(now)
         return True
 
@@ -92,11 +83,11 @@ logger = logging.getLogger(__name__)
 flask_app = Flask(__name__)
 application = None
 
-# --- DATA LOADING ---
+# --- DATA ---
 @lru_cache(maxsize=1)
 def load_excel_data():
     try:
-        df = pd.read_excel(settings.EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
+        df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         df = df.fillna('')
         return df.astype(str).to_dict(orient='records')
     except Exception as e:
@@ -105,7 +96,7 @@ def load_excel_data():
 
 def refresh_data():
     now = time.time()
-    if now - state.last_refresh > settings.CACHE_TTL:
+    if now - state.last_refresh > CACHE_TTL:
         load_excel_data.cache_clear()
         data = load_excel_data()
         if data:
@@ -116,10 +107,9 @@ def refresh_data():
                     if row[field]: state.get_id(row[field])
 
 def get_display_name(user):
-    # Ưu tiên tên đầy đủ, nếu không có thì dùng username, nếu không có thì dùng id
     return (user.full_name or user.username or str(user.id)).strip()
 
-# --- BOT UTILITIES ---
+# --- BOT UTIL ---
 async def safe_send_and_track(func, update, *args, **kwargs):
     try:
         sent_msg = await func(*args, **kwargs)
@@ -140,7 +130,7 @@ async def delete_user_messages(update, context):
             pass
     state.user_message_ids[user_id].clear()
 
-# --- BOT HANDLERS ---
+# --- HANDLERS ---
 async def send_initial_buttons(update: Update, context=None):
     refresh_data()
     if not state.data:
@@ -204,7 +194,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'rep3': rep3,
                 'rep4': rep4,
                 'name': get_display_name(user),
-                'user_id': user.id
+                'user_id': user.id,
+                'username': user.username
             }
             times = [
                 ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
@@ -267,16 +258,20 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
-    # --- Cấu trúc mới: Mã số - Số hiệu - Tên KH @user_id - Thời gian đến ---
-    msg = f"{info['rep3']} - {info['rep4']} - {info['name']} @{info['user_id']} - {time_value}"
-    await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
+    username = info.get('username')
+    if username:
+        kh_info = f'<a href="https://t.me/{username}">{info["name"]} (@{username})</a>'
+    else:
+        kh_info = f'<a href="tg://user?id={info["user_id"]}">{info["name"]}</a>'
+    msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
+    await context.bot.send_message(chat_id=CHANNEL_ID, text=msg, parse_mode='HTML')
     await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
 
 # --- APP SETUP ---
-@flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
 async def webhook_handler():
     if not application:
         return "Bot not ready", 503
@@ -295,6 +290,7 @@ async def process_update(update_dict: dict):
 
 @flask_app.route("/health")
 def health_check():
+    from datetime import datetime, timezone
     return jsonify({
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -305,12 +301,12 @@ async def init_application():
     global application
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.DEBUG if settings.DEBUG else logging.INFO
+        level=logging.INFO
     )
     try:
         application = (
             ApplicationBuilder()
-            .token(settings.BOT_TOKEN)
+            .token(BOT_TOKEN)
             .concurrent_updates(True)
             .build()
         )
@@ -320,7 +316,7 @@ async def init_application():
         application.add_handler(CallbackQueryHandler(handle_button))
         application.add_error_handler(error_handler)
         await application.initialize()
-        await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
+        await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
         refresh_data()
         return True
     except Exception as e:
@@ -331,7 +327,7 @@ async def run_application():
     try:
         if await init_application():
             config = Config()
-            config.bind = [f"0.0.0.0:{settings.PORT}"]
+            config.bind = [f"0.0.0.0:{PORT}"]
             await serve(flask_app, config)
         else:
             raise RuntimeError("Application initialization failed")
