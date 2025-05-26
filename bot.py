@@ -4,12 +4,12 @@ import asyncio
 import pandas as pd
 import time
 from collections import defaultdict
-from typing import Dict, List, Set
+from typing import Dict, List
 from functools import lru_cache
 from datetime import datetime, timezone
 from pydantic_settings import BaseSettings
 from pydantic import Field
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters, CallbackQueryHandler
@@ -221,9 +221,10 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     time_value = data[5:]
     await safe_send_and_track(query.answer, update)
     if time_value == "other":
-        sent = await safe_send_and_track(
+        await safe_send_and_track(
             query.edit_message_text, update,
-            MESSAGES["ask_manual_time"]
+            MESSAGES["ask_manual_time"],
+            reply_markup=ForceReply(selective=True)
         )
         state.waiting_time_input[user_id]["waiting_manual_time"] = True
     else:
@@ -231,19 +232,29 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in state.waiting_time_input and state.waiting_time_input[user_id].get("waiting_manual_time"):
+    logger.info(f"Received manual time from user {user_id}: {update.message.text}")
+    logger.info(f"State for this user: {state.waiting_time_input.get(user_id)}")
+    if (
+        user_id in state.waiting_time_input and 
+        state.waiting_time_input[user_id].get("waiting_manual_time")
+    ):
         time_value = update.message.text.strip()
         await send_to_channel_and_finish(update, context, user_id, time_value)
         state.waiting_time_input[user_id].pop("waiting_manual_time", None)
 
 async def send_to_channel_and_finish(update, context, user_id, time_value):
     info = state.waiting_time_input.pop(user_id, None)
-    if not info: return
+    if not info:
+        logger.warning(f"No waiting_time_input for user {user_id}")
+        return
     name = info["name"]
     rep3 = info["rep3"]
     msg = f"{name} - {rep3} - {time_value}"
     await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
     await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Exception while handling update:", exc_info=context.error)
 
 def run_async(coro):
     loop = asyncio.new_event_loop()
@@ -294,6 +305,7 @@ async def init_application():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_time))
         application.add_handler(CallbackQueryHandler(handle_time_select, pattern="^time:"))
         application.add_handler(CallbackQueryHandler(handle_button))
+        application.add_error_handler(error_handler)
         await application.initialize()
         await application.bot.set_webhook(url=f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}")
         refresh_data()
