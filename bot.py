@@ -14,6 +14,13 @@ from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
 
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # --- CONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
@@ -22,7 +29,7 @@ EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
 MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", 30))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
 WEBHOOK_PATH = "/webhook_telegram"
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002647531334"))
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002647531334")
 
 MESSAGES = {
     "welcome": (
@@ -79,8 +86,7 @@ class State:
         return self.id_strings.get(i, '')
 
 state = State()
-logger = logging.getLogger(__name__)
-flask_app = Flask(__name__)
+app = Flask(__name__)
 application = None
 
 # --- DATA MANAGEMENT ---
@@ -132,7 +138,7 @@ async def delete_user_messages(update, context):
             pass
     state.user_message_ids[user_id].clear()
 
-# --- COMMAND HANDLERS ---
+# --- HANDLERS ---
 async def send_initial_buttons(update: Update):
     refresh_data()
     if not state.data:
@@ -283,7 +289,6 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
         f'<a href="tg://user?id={info["user_id"]}">{info["name"]}</a>'
     )
     
-    # Gửi thông tin lên channel cho admin (bao gồm rep3/rep4)
     msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
     await safe_message_send(
         context.bot.send_message,
@@ -292,7 +297,6 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
         parse_mode='HTML'
     )
     
-    # Gửi thông báo cảm ơn cho khách (không có rep3)
     await safe_send_and_track(
         update.effective_message.reply_text,
         update,
@@ -300,8 +304,8 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
         parse_mode='HTML'
     )
 
-# --- WEBHOOK HANDLING ---
-@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+# --- WEBHOOK ---
+@app.route(WEBHOOK_PATH, methods=["POST"])
 async def webhook_handler():
     if not application:
         return "Bot not ready", 503
@@ -314,7 +318,7 @@ async def webhook_handler():
         logger.error(f"Webhook error: {e}")
         return "ok", 200
 
-@flask_app.route("/health")
+@app.route("/health")
 def health_check():
     from datetime import datetime, timezone
     return jsonify({
@@ -323,13 +327,9 @@ def health_check():
         "version": "1.0.0"
     })
 
-# --- APPLICATION SETUP ---
-async def init_application():
+# --- INITIALIZATION ---
+async def init_bot():
     global application
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO
-    )
     try:
         application = (
             ApplicationBuilder()
@@ -338,30 +338,34 @@ async def init_application():
             .build()
         )
         
-        # Add handlers
         application.add_handler(CommandHandler("start", handle_start))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_time))
         application.add_handler(CallbackQueryHandler(handle_time_select, pattern="^time:"))
         application.add_handler(CallbackQueryHandler(handle_button))
         
-        # Initialize application
         await application.initialize()
         await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
         refresh_data()
         return True
-        
     except Exception as e:
-        logger.critical(f"Initialization error: {e}")
+        logger.error(f"Bot initialization error: {e}")
         return False
 
-# --- MAIN ---
 if __name__ == '__main__':
     try:
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         
-        # Sử dụng event loop mặc định của Hypercorn
-        asyncio.run(serve(flask_app, config))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Initialize bot first
+        if not loop.run_until_complete(init_bot()):
+            raise RuntimeError("Failed to initialize bot")
+            
+        # Then run web server
+        loop.run_until_complete(serve(app, config))
+        
     except KeyboardInterrupt:
         logger.info("Shutdown by user")
     except Exception as e:
