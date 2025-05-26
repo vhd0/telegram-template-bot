@@ -116,6 +116,7 @@ def refresh_data():
                     if row[field]: state.get_id(row[field])
 
 def get_display_name(user):
+    # Ưu tiên tên đầy đủ, nếu không có thì dùng username, nếu không có thì dùng id
     return (user.full_name or user.username or str(user.id)).strip()
 
 # --- BOT UTILITIES ---
@@ -266,7 +267,7 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
-    # --- Cấu trúc mới ---
+    # --- Cấu trúc mới: Mã số - Số hiệu - Tên KH @user_id - Thời gian đến ---
     msg = f"{info['rep3']} - {info['rep4']} - {info['name']} @{info['user_id']} - {time_value}"
     await context.bot.send_message(chat_id=CHANNEL_ID, text=msg)
     await safe_send_and_track(update.effective_message.reply_text, update, MESSAGES["final_thanks"], parse_mode='HTML')
