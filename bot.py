@@ -5,6 +5,7 @@ import pandas as pd
 import time
 from collections import defaultdict
 from functools import lru_cache
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -16,17 +17,13 @@ from hypercorn.config import Config
 
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
 PORT = int(os.getenv("PORT", 8443))
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
-MAX_REQUESTS_PER_MINUTE = int(os.getenv("MAX_REQUESTS_PER_MINUTE", 30))
-CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
+CACHE_TTL = int(os.getenv("CACHE_TTL", 300)) # 5 minutes
 WEBHOOK_PATH = "/webhook_telegram"
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002647531334")
-
-# Đảm bảo sử dụng một event loop duy nhất
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
+MAX_REQUESTS_PER_MINUTE = 30
 
 MESSAGES = {
     "welcome": (
@@ -49,7 +46,11 @@ MESSAGES = {
     )
 }
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# --- Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 class State:
@@ -113,7 +114,7 @@ def refresh_data():
 # --- Message Handling ---
 async def send_message(update, message_func, text, **kwargs):
     try:
-        msg = await loop.create_task(message_func(text=text, **kwargs))
+        msg = await message_func(text=text, **kwargs)
         if msg and hasattr(msg, 'message_id'):
             state.user_message_ids[update.effective_user.id].append(msg.message_id)
         return msg
@@ -126,7 +127,7 @@ async def delete_messages(update, context):
     chat_id = update.effective_chat.id
     for msg_id in state.user_message_ids[user_id]:
         try:
-            await loop.create_task(context.bot.delete_message(chat_id=chat_id, message_id=msg_id))
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception:
             pass
     state.user_message_ids[user_id].clear()
@@ -141,7 +142,6 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.waiting_time_input.pop(user_id, None)
     await delete_messages(update, context)
     
-    # Send initial buttons
     refresh_data()
     if not state.data:
         return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
@@ -181,19 +181,19 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
             if rep1s:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
-                await loop.create_task(query.edit_message_text(
+                await query.edit_message_text(
                     text=f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
-                ))
+                )
         
         elif level == "rep1":
             rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
-                await loop.create_task(query.edit_message_text(
+                await query.edit_message_text(
                     text=f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
-                ))
+                )
         
         elif level == "rep2":
             row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
@@ -212,17 +212,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
                 ]
                 keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
-                await loop.create_task(query.edit_message_text(
+                await query.edit_message_text(
                     text=MESSAGES["ask_time"],
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
-                ))
+                )
             else:
-                await loop.create_task(query.edit_message_text(text=MESSAGES["no_data"]))
+                await query.edit_message_text(text=MESSAGES["no_data"])
     
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await loop.create_task(query.message.reply_text(MESSAGES["error"]))
+        await send_message(update, query.message.reply_text, MESSAGES["error"])
     
     finally:
         state.processing[user_id] = False
@@ -237,21 +237,23 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     
     if user_id not in state.waiting_time_input:
-        return await loop.create_task(query.edit_message_text(text="再度最初からご選択ください。"))
+        return await query.edit_message_text(text="再度最初からご選択ください。")
     
     if time_value == "other":
         try:
-            await loop.create_task(context.bot.delete_message(
+            await context.bot.delete_message(
                 chat_id=query.message.chat.id,
                 message_id=query.message.message_id
-            ))
+            )
         except Exception:
             pass
         
-        await loop.create_task(update.effective_chat.send_message(
-            text=MESSAGES["ask_manual_time"],
+        await send_message(
+            update,
+            update.effective_chat.send_message,
+            MESSAGES["ask_manual_time"],
             reply_markup=ForceReply(selective=True)
-        ))
+        )
         state.waiting_time_input[user_id]["waiting_manual_time"] = True
     else:
         await send_to_channel_and_finish(update, context, user_id, time_value)
@@ -276,28 +278,35 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     
     msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
     try:
-        await loop.create_task(context.bot.send_message(
+        await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=msg,
             parse_mode='HTML'
-        ))
+        )
     except Exception as e:
         logger.error(f"Channel message error: {e}")
     
-    await loop.create_task(update.effective_message.reply_text(
-        text=MESSAGES["final_thanks"],
+    await send_message(
+        update,
+        update.effective_message.reply_text,
+        MESSAGES["final_thanks"],
         parse_mode='HTML'
-    ))
+    )
 
 # --- Webhook ---
 @app.route(WEBHOOK_PATH, methods=["POST"])
-async def webhook_handler():
+def webhook_handler():
     if not application:
         return "Bot not ready", 503
     try:
         if data := request.get_json(force=True):
             update = Update.de_json(data, application.bot)
-            await loop.create_task(application.process_update(update))
+            
+            async def process_update():
+                await application.process_update(update)
+            
+            asyncio.run(process_update())
+            
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -307,7 +316,7 @@ async def webhook_handler():
 def health_check():
     return jsonify({
         "status": "ok",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "version": "1.0.0"
     })
 
@@ -335,16 +344,18 @@ async def init_bot():
         logger.error(f"Bot initialization error: {e}")
         return False
 
-# --- Main ---
 if __name__ == '__main__':
     try:
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
         
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Initialize bot
         if not loop.run_until_complete(init_bot()):
             raise RuntimeError("Failed to initialize bot")
-        
+            
         # Run web server
         loop.run_until_complete(serve(app, config))
         
@@ -353,3 +364,8 @@ if __name__ == '__main__':
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         raise
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
