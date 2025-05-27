@@ -53,6 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- State Management ---
 class State:
     def __init__(self):
         self.data = []
@@ -275,7 +276,9 @@ async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
         state.waiting_time_input[user_id].pop("waiting_manual_time", None)
 
 async def send_to_channel_and_finish(update, context, user_id, time_value):
-    if not (info := state.waiting_time_input.pop(user_id, None)):
+    """Gửi thông tin về channel, xóa các tin nhắn cũ với user, chỉ để lại tin cảm ơn cuối."""
+    info = state.waiting_time_input.pop(user_id, None)
+    if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
     username = info.get('username')
@@ -294,21 +297,13 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     except Exception as e:
         logger.error(f"Channel message error: {e}")
 
-    # XÓA TẤT CẢ TIN NHẮN TRƯỚC ĐÓ
+    # XÓA TẤT CẢ TIN NHẮN TRƯỚC
     await delete_messages(update, context)
 
     # GỬI LẠI CHỈ TIN NHẮN FINAL
     await send_message(
         update,
-        update.effective_chat.send_message,  # CHÚ Ý: dùng send_message thay vì reply_text để không bị reply vào tin cũ vừa xóa
-        MESSAGES["final_thanks"],
-        parse_mode='HTML'
-    )
-    except Exception as e:
-        logger.error(f"Channel message error: {e}")
-    await send_message(
-        update,
-        update.effective_message.reply_text,
+        update.effective_chat.send_message,
         MESSAGES["final_thanks"],
         parse_mode='HTML'
     )
@@ -363,6 +358,7 @@ async def init_bot():
         logger.error(f"Bot initialization error: {e}")
         return False
 
+# --- Main Entrypoint ---
 if __name__ == '__main__':
     try:
         config = Config()
