@@ -128,7 +128,7 @@ async def delete_messages(update, context):
     for msg_id in state.user_message_ids[user_id]:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
+        except Exception:  # ignore all delete errors
             pass
     state.user_message_ids[user_id].clear()
 
@@ -161,12 +161,20 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     if not state.can_request(user_id) or state.processing.get(user_id):
-        await query.answer(MESSAGES["processing"])
+        try:
+            await query.answer(MESSAGES["processing"], show_alert=True)
+        except Exception:
+            pass
         return
 
     try:
         state.processing[user_id] = True
-        await query.answer()
+        # Always answer callback, even if error
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
         refresh_data()
         
         level, *ids = query.data.split(':')
@@ -185,6 +193,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+            else:
+                await query.edit_message_text(text=MESSAGES["no_data"])
         
         elif level == "rep1":
             rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
@@ -194,6 +204,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+            else:
+                await query.edit_message_text(text=MESSAGES["no_data"])
         
         elif level == "rep2":
             row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
@@ -219,11 +231,19 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await query.edit_message_text(text=MESSAGES["no_data"])
+        else:
+            await query.edit_message_text(text=MESSAGES["error"])
     
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await send_message(update, query.message.reply_text, MESSAGES["error"])
-    
+        try:
+            await query.answer(MESSAGES["error"], show_alert=True)
+        except Exception:
+            pass
+        try:
+            await send_message(update, query.message.reply_text, MESSAGES["error"])
+        except Exception:
+            pass
     finally:
         state.processing[user_id] = False
 
@@ -234,12 +254,20 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     time_value = data[5:]
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     
     if user_id not in state.waiting_time_input:
-        return await query.edit_message_text(text="再度最初からご選択ください。")
+        try:
+            await query.edit_message_text(text="再度最初からご選択ください。")
+        except Exception:
+            pass
+        return
     
     if time_value == "other":
+        # Try to delete the selection message (ignore errors)
         try:
             await context.bot.delete_message(
                 chat_id=query.message.chat.id,
@@ -367,5 +395,5 @@ if __name__ == '__main__':
     finally:
         try:
             loop.close()
-        except:
+        except Exception:
             pass
