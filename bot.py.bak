@@ -28,7 +28,7 @@ MAX_REQUESTS_PER_MINUTE = 30
 MESSAGES = {
     "welcome": (
         "三上はじめにようこそお越しくださいました。ご利用いただき、誠にありがとうございます。\n"
-        "下記の選択肢よりご希望の項目をお選びください。\n\n"
+        "ご希望の場所を以下の選択肢よりお選びください。\n\n"
         "※ボタンを押した後、処理に数秒かかる場合がございます。反応がない場合は再度お試しください。"
     ),
     "processing": "⏳ 現在処理中です。しばらくお待ちください。",
@@ -53,6 +53,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- State Management ---
 class State:
     def __init__(self):
         self.data = []
@@ -207,9 +208,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'username': update.effective_user.username
                 }
                 times = [
-                    ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
-                    ("12:00", "12:00"), ("14:00", "14:00"), ("16:00", "16:00"),
-                    ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
+                    ("11:00", "11:00"), ("12:00", "12:00"), ("13:00", "13:00"),
+                    ("14:00", "14:00"), ("16:00", "16:00"), ("18:00", "18:00"),
+                    ("20:00", "20:00"), ("22:00", "22:00"), ("その他", "other")
                 ]
                 keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
                 await query.edit_message_text(
@@ -275,7 +276,9 @@ async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
         state.waiting_time_input[user_id].pop("waiting_manual_time", None)
 
 async def send_to_channel_and_finish(update, context, user_id, time_value):
-    if not (info := state.waiting_time_input.pop(user_id, None)):
+    """Gửi thông tin về channel, xóa các tin nhắn cũ với user, chỉ để lại tin cảm ơn cuối."""
+    info = state.waiting_time_input.pop(user_id, None)
+    if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
     username = info.get('username')
@@ -293,9 +296,14 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
         )
     except Exception as e:
         logger.error(f"Channel message error: {e}")
+
+    # XÓA TẤT CẢ TIN NHẮN TRƯỚC
+    await delete_messages(update, context)
+
+    # GỬI LẠI CHỈ TIN NHẮN FINAL
     await send_message(
         update,
-        update.effective_message.reply_text,
+        update.effective_chat.send_message,
         MESSAGES["final_thanks"],
         parse_mode='HTML'
     )
@@ -350,6 +358,7 @@ async def init_bot():
         logger.error(f"Bot initialization error: {e}")
         return False
 
+# --- Main Entrypoint ---
 if __name__ == '__main__':
     try:
         config = Config()
