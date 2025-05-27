@@ -293,6 +293,19 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
         )
     except Exception as e:
         logger.error(f"Channel message error: {e}")
+
+    # XÓA TẤT CẢ TIN NHẮN TRƯỚC ĐÓ
+    await delete_messages(update, context)
+
+    # GỬI LẠI CHỈ TIN NHẮN FINAL
+    await send_message(
+        update,
+        update.effective_chat.send_message,  # CHÚ Ý: dùng send_message thay vì reply_text để không bị reply vào tin cũ vừa xóa
+        MESSAGES["final_thanks"],
+        parse_mode='HTML'
+    )
+    except Exception as e:
+        logger.error(f"Channel message error: {e}")
     await send_message(
         update,
         update.effective_message.reply_text,
