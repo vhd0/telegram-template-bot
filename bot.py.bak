@@ -88,6 +88,7 @@ class State:
 state = State()
 app = Flask(__name__)
 application = None
+main_loop = None  # GLOBAL event loop
 
 # --- Data Management ---
 @lru_cache(maxsize=1)
@@ -302,23 +303,18 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
 # --- Webhook ---
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
-    if not application:
+    global main_loop
+    if not application or not main_loop:
         return "Bot not ready", 503
     try:
         if data := request.get_json(force=True):
             update = Update.de_json(data, application.bot)
+            # Đảm bảo dùng đúng main_loop (loop khởi tạo bot), không tạo loop mới!
+            future = asyncio.run_coroutine_threadsafe(application.process_update(update), main_loop)
             try:
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                if loop.is_running():
-                    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
-                else:
-                    loop.run_until_complete(application.process_update(update))
+                future.result(timeout=10)  # Có thể bỏ timeout nếu muốn fire-and-forget
             except Exception as err:
-                logger.error(f"Loop handling error: {err}")
+                logger.error(f"Coroutine error: {err}")
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -334,7 +330,7 @@ def health_check():
 
 # --- Init ---
 async def init_bot():
-    global application
+    global application, main_loop
     try:
         application = (
             ApplicationBuilder()
@@ -348,7 +344,7 @@ async def init_bot():
         application.add_handler(CallbackQueryHandler(handle_button))
         await application.initialize()
         await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
-        refresh_data()
+        main_loop = asyncio.get_running_loop()
         return True
     except Exception as e:
         logger.error(f"Bot initialization error: {e}")
