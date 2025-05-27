@@ -3,464 +3,373 @@ import os
 import asyncio
 import pandas as pd
 import time
-from pathlib import Path
 from collections import defaultdict
-from typing import Dict, List, Set, Optional
 from functools import lru_cache
-from datetime import datetime, timezone
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler
+    ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
-from asgiref.sync import async_to_sync
 
-# --- Settings Management ---
-class Settings(BaseSettings):
-    """Application settings with validation"""
-    BOT_TOKEN: str
-    WEBHOOK_URL: str
-    PORT: int = Field(default=int(os.getenv('PORT', 8443)))
-    EXCEL_FILE_PATH: str = Field(default="rep.xlsx")
-    MAX_REQUESTS_PER_MINUTE: int = Field(default=30)
-    CACHE_TTL: int = Field(default=300)
-    WEBHOOK_PATH: str = Field(default="/webhook_telegram")
-    DEBUG: bool = Field(default=False)
+# --- Config ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PORT = int(os.getenv("PORT", 8443))
+EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
+CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
+WEBHOOK_PATH = "/webhook_telegram"
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002647531334")
+MAX_REQUESTS_PER_MINUTE = 30
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-# --- Constants ---
-TELEGRAM_CHANNEL = "https://t.me/mikami8186lt"
 MESSAGES = {
-    "welcome": """三上はじめにへようこそ。以下の選択肢からお選びください。
-
-**ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。**""",
-    "processing": "ボタンを押した後、処理のためしばらくお待ちください。数秒経っても変化がない場合は、再度ボタンをタップしてください。ありがとうございます。",
-    "instruction": f"受け取った番号を、到着の10分前までにこちらのチャンネル <a href='{TELEGRAM_CHANNEL}'>Telegramチャネル</a> に送信してください。よろしくお願いいたします！",
-    "wait_time": "通常、5分以内に部屋番号をお知らせしますが、担当者が忙しい場合、30分以上お待ちいただくこともございます。恐れ入りますが、しばらくお待ちください。",
-    "no_data": "申し訳ありませんが、現在データを利用できません。しばらくしてからもう一度お試しください。",
-    "rate_limit": "多くのリクエストを送信しています。しばらくお待ちください。",
-    "error": "エラーが発生しました。もう一度お試しください。",
-    "restart": "選択肢を始めるか、選択ボードを再起動するには、/start と入力してください。"
+    "welcome": (
+        "三上はじめにようこそお越しくださいました。ご利用いただき、誠にありがとうございます。\n"
+        "下記の選択肢よりご希望の項目をお選びください。\n\n"
+        "※ボタンを押した後、処理に数秒かかる場合がございます。反応がない場合は再度お試しください。"
+    ),
+    "processing": "⏳ 現在処理中です。しばらくお待ちください。",
+    "next_step": "次の項目をお選びください。",
+    "selected": "ご選択いただいた項目：{}",
+    "no_data": "申し訳ございませんが、現在ご案内可能なデータがございません。",
+    "rate_limit": "リクエストが多すぎます。しばらく経ってから再度お試しください。",
+    "error": "エラーが発生しました。お手数ですが、もう一度お試しください。",
+    "ask_time": "ご到着予定時刻をお知らせください。（下記より選択、または「その他」の場合はご入力ください）",
+    "ask_manual_time": "ご到着予定時刻を「HH:MM」形式でご入力くださいませ。",
+    "final_thanks": (
+        "この度は、ご利用ありがとうございます。\n"
+        "三上が内容を確認し、追ってご連絡差し上げます。\n"
+        "弊社からのメッセージを見逃さないよう、お電話にご注意ください。"
+    )
 }
 
-# --- Initialize Apps ---
-settings = Settings()
+# --- Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
-flask_app = Flask(__name__)
-application = None
 
-# --- Data Models ---
-class ExcelData(BaseModel):
-    """Data model for Excel rows"""
-    Key: str
-    Rep1: str
-    Rep2: str
-    Rep3: str
-
-class BotState:
-    """Global state management"""
+class State:
     def __init__(self):
-        self.data: List[dict] = []
-        self.string_ids: Dict[str, int] = {}
-        self.id_strings: Dict[int, str] = {}
-        self.next_id: int = 0
-        self.welcomed_users: Set[int] = set()
-        self.last_refresh: float = 0
-        self._requests: Dict[int, List[float]] = defaultdict(list)
-        self.user_messages: Dict[int, Dict[str, int]] = defaultdict(dict)
-        self.last_user_activity: Dict[int, float] = {}
+        self.data = []
+        self.string_ids = {}
+        self.id_strings = {}
+        self.next_id = 0
+        self.last_refresh = 0
+        self._requests = defaultdict(list)
+        self.processing = {}
+        self.user_message_ids = defaultdict(list)
+        self.waiting_time_input = {}
 
-    def can_request(self, user_id: int, window: int = 60) -> bool:
-        """Check if user can make a request (rate limiting)"""
+    def can_request(self, user_id: int) -> bool:
         now = time.time()
-        user_requests = self._requests[user_id]
-        
-        while user_requests and user_requests[0] < now - window:
-            user_requests.pop(0)
-        
-        if len(user_requests) >= settings.MAX_REQUESTS_PER_MINUTE:
+        self._requests[user_id] = [r for r in self._requests[user_id] if now - r < 60]
+        if len(self._requests[user_id]) >= MAX_REQUESTS_PER_MINUTE:
             return False
-            
-        user_requests.append(now)
+        self._requests[user_id].append(now)
         return True
 
-    def get_id(self, text: str) -> int:
-        """Get or create ID for text"""
-        if not text:
+    def get_id(self, s: str) -> int:
+        if not s:
             return -1
-            
-        if text not in self.string_ids:
-            self.string_ids[text] = self.next_id
-            self.id_strings[self.next_id] = text
+        if s not in self.string_ids:
+            self.string_ids[s] = self.next_id
+            self.id_strings[self.next_id] = s
             self.next_id += 1
-        return self.string_ids[text]
+        return self.string_ids[s]
 
-    def get_string(self, id: int) -> str:
-        """Get string from ID"""
-        return self.id_strings.get(id, '')
+    def get_string(self, i: int) -> str:
+        return self.id_strings.get(i, '')
 
-    def update_activity(self, user_id: int) -> None:
-        """Update last activity time for user"""
-        self.last_user_activity[user_id] = time.time()
-
-    def reset_user(self, user_id: int) -> None:
-        """Reset all state for a user"""
-        self.welcomed_users.discard(user_id)
-        self.user_messages.pop(user_id, None)
-        self._requests.pop(user_id, None)
-        self.update_activity(user_id)
-
-    async def cleanup_user_messages(self, user_id: int, chat_id: int, bot) -> None:
-        """Clean up old messages for a user"""
-        if user_id in self.user_messages:
-            for msg_id in self.user_messages[user_id].values():
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except Exception as e:
-                    logger.warning(f"Could not delete message {msg_id}: {e}")
-            self.user_messages[user_id].clear()
-
-state = BotState()
+state = State()
+app = Flask(__name__)
+application = None
 
 # --- Data Management ---
 @lru_cache(maxsize=1)
-def load_excel_data() -> List[dict]:
-    """Load and validate Excel data"""
+def load_excel_data():
     try:
-        file_path = Path(settings.EXCEL_FILE_PATH)
-        if not file_path.exists():
-            logger.error(f"Excel file not found: {file_path}")
-            return []
-
-        df = pd.read_excel(
-            file_path,
-            engine='openpyxl',
-            na_values=[''],
-            keep_default_na=False
-        )
-
-        required_cols = ["Key", "Rep1", "Rep2", "Rep3"]
-        if missing_cols := [col for col in required_cols if col not in df.columns]:
-            logger.error(f"Missing columns: {missing_cols}")
-            return []
-
-        df = df.fillna('')
-        data = df.astype(str).to_dict(orient='records')
-        
-        valid_data = []
-        for row in data:
-            try:
-                ExcelData(**row)
-                valid_data.append(row)
-            except Exception as e:
-                logger.warning(f"Invalid row data: {e}")
-                continue
-
-        logger.info(f"Loaded {len(valid_data)} valid rows")
-        return valid_data
-
+        df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
+        return df.fillna('').astype(str).to_dict(orient='records')
     except Exception as e:
         logger.error(f"Excel loading error: {e}")
         return []
 
-def refresh_data() -> None:
-    """Refresh cached data if needed"""
+def refresh_data():
     now = time.time()
-    if now - state.last_refresh > settings.CACHE_TTL:
+    if now - state.last_refresh > CACHE_TTL:
         load_excel_data.cache_clear()
-        if new_data := load_excel_data():
-            state.data = new_data
+        if data := load_excel_data():
+            state.data = data
             state.last_refresh = now
-            
-            for row in state.data:
+            for row in data:
                 for field in ["Key", "Rep1", "Rep2"]:
                     if row[field]:
                         state.get_id(row[field])
-            
-            logger.info("Data cache refreshed")
-        else:
-            logger.warning("No data loaded during refresh")
 
-# --- Message Handlers ---
-async def send_initial_buttons(update: Update) -> None:
-    """Send welcome message with initial options"""
+# --- Message Handling ---
+async def send_message(update, message_func, text, **kwargs):
     try:
-        refresh_data()
-        
-        if not state.data:
-            await update.message.reply_text(MESSAGES["no_data"])
-            return
-        
-        initial_keys = {row["Key"] for row in state.data if row["Key"]}
-        if not initial_keys:
-            await update.message.reply_text(MESSAGES["no_data"])
-            return
-        
-        keyboard = [
-            [InlineKeyboardButton(key, callback_data=f"key:{state.get_id(key)}::")]
-            for key in sorted(initial_keys)
-        ]
-        
-        # Send new welcome message
-        message = await update.message.reply_text(
-            MESSAGES["welcome"],
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
-        
-        # Store message ID
-        user_id = update.effective_user.id
-        state.user_messages[user_id]['welcome'] = message.message_id
-        
+        msg = await message_func(text=text, **kwargs)
+        if msg and hasattr(msg, 'message_id'):
+            state.user_message_ids[update.effective_user.id].append(msg.message_id)
+        return msg
     except Exception as e:
-        logger.error(f"Error sending initial buttons: {e}")
-        await update.message.reply_text(MESSAGES["error"])
+        logger.error(f"Message error: {e}")
+        return None
 
-async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command"""
+async def delete_messages(update, context):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    
-    if not state.can_request(user_id):
-        await update.message.reply_text(MESSAGES["rate_limit"])
-        return
-    
-    try:
-        # Clean up old messages
-        await state.cleanup_user_messages(user_id, chat_id, context.bot)
-        
-        # Reset user state
-        state.reset_user(user_id)
-        
-        # Send new welcome message
-        await send_initial_buttons(update)
-        state.welcomed_users.add(user_id)
-        state.update_activity(user_id)
-        
-        logger.info(f"User restarted: {user_id}")
-        
-    except Exception as e:
-        logger.error(f"Error in start handler: {e}")
-        await update.message.reply_text(MESSAGES["error"])
+    for msg_id in state.user_message_ids[user_id]:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            pass
+    state.user_message_ids[user_id].clear()
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming messages"""
+# --- Handlers ---
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    state.update_activity(user_id)
-    
     if not state.can_request(user_id):
-        await update.message.reply_text(MESSAGES["rate_limit"])
-        return
-    
-    await update.message.reply_text(MESSAGES["restart"])
+        return await send_message(update, update.message.reply_text, MESSAGES["rate_limit"])
+    state.processing[user_id] = False
+    state.waiting_time_input.pop(user_id, None)
+    await delete_messages(update, context)
+    refresh_data()
+    if not state.data:
+        return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
+    keys = sorted({row["Key"] for row in state.data if row["Key"]})
+    keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
+    await send_message(
+        update,
+        update.message.reply_text,
+        MESSAGES["welcome"],
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle button callbacks"""
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    
     user_id = update.effective_user.id
-    state.update_activity(user_id)
-    
-    if not state.can_request(user_id):
-        await query.message.reply_text(MESSAGES["rate_limit"])
+    if not state.can_request(user_id) or state.processing.get(user_id):
+        try:
+            await query.answer(MESSAGES["processing"], show_alert=True)
+        except Exception:
+            pass
         return
-    
     try:
-        async with asyncio.timeout(10):
-            refresh_data()
-            
-            level, *ids = query.data.split(':')
-            selected_ids = [int(id_) if id_ else -1 for id_ in ids]
-            key_id, rep1_id, rep2_id = selected_ids + [-1] * (3 - len(selected_ids))
-            
-            key = state.get_string(key_id)
-            rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
-            rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
-            
-            if level == "key":
-                next_rep1 = {
-                    row["Rep1"] for row in state.data
-                    if row["Key"] == key and row["Rep1"]
-                }
-                
-                if next_rep1:
-                    keyboard = [
-                        [InlineKeyboardButton(
-                            r1,
-                            callback_data=f"rep1:{key_id}:{state.get_id(r1)}:"
-                        )]
-                        for r1 in sorted(next_rep1)
-                    ]
-                    
-                    # Store message ID
-                    msg = await query.edit_message_text(
-                        f"選択されました: {key}\n{MESSAGES['processing']}\n\n次に進んでください:",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    state.user_messages[user_id]['key'] = msg.message_id
-                else:
-                    await query.edit_message_text(
-                        f"選択されました: {key}\n{MESSAGES['no_data']}"
-                    )
-            
-            elif level == "rep1":
-                next_rep2 = {
-                    row["Rep2"] for row in state.data
-                    if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]
-                }
-                
-                if next_rep2:
-                    keyboard = [
-                        [InlineKeyboardButton(
-                            r2,
-                            callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}"
-                        )]
-                        for r2 in sorted(next_rep2)
-                    ]
-                    
-                    # Store message ID
-                    msg = await query.edit_message_text(
-                        f"選択されました: {rep1}\n{MESSAGES['processing']}\n\n次に進んでください:",
-                        reply_markup=InlineKeyboardMarkup(keyboard)
-                    )
-                    state.user_messages[user_id]['rep1'] = msg.message_id
-                else:
-                    await query.edit_message_text(
-                        f"選択されました: {rep1}\n{MESSAGES['no_data']}"
-                    )
-            
-            elif level == "rep2":
-                rep3 = next(
-                    (row["Rep3"] for row in state.data
-                     if row["Key"] == key and
-                     row["Rep1"] == rep1 and
-                     row["Rep2"] == rep2),
-                    MESSAGES["no_data"]
+        state.processing[user_id] = True
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        refresh_data()
+        level, *ids = query.data.split(':')
+        ids = [int(i) if i else -1 for i in ids]
+        key_id, rep1_id, rep2_id = ids + [-1] * (3 - len(ids))
+        key = state.get_string(key_id)
+        rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
+        rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
+        if level == "key":
+            rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
+            if rep1s:
+                keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
+                await query.edit_message_text(
+                    text=f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                
-                # Store message IDs
-                msg1 = await query.edit_message_text(f"あなたの番号: {rep3}")
-                state.user_messages[user_id]['rep2'] = msg1.message_id
-                
-                msg2 = await query.message.reply_text(
-                    f"{MESSAGES['instruction']}\n\n{MESSAGES['wait_time']}",
+            else:
+                await query.edit_message_text(text=MESSAGES["no_data"])
+        elif level == "rep1":
+            rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
+            if rep2s:
+                keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
+                await query.edit_message_text(
+                    text=f"{MESSAGES['selected'].format(rep1)}\n{MESSAGES['next_step']}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await query.edit_message_text(text=MESSAGES["no_data"])
+        elif level == "rep2":
+            row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
+            if row:
+                state.waiting_time_input[user_id] = {
+                    'rep3': row.get("Rep3", ""),
+                    'rep4': row.get("Rep4", ""),
+                    'name': update.effective_user.full_name or update.effective_user.username or str(user_id),
+                    'user_id': user_id,
+                    'username': update.effective_user.username
+                }
+                times = [
+                    ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
+                    ("12:00", "12:00"), ("14:00", "14:00"), ("16:00", "16:00"),
+                    ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
+                ]
+                keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
+                await query.edit_message_text(
+                    text=MESSAGES["ask_time"],
+                    reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='HTML'
                 )
-                state.user_messages[user_id]['final'] = msg2.message_id
-            
             else:
-                await query.edit_message_text(MESSAGES["error"])
-                
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout for user {user_id}")
-        await query.message.reply_text(MESSAGES["error"])
+                await query.edit_message_text(text=MESSAGES["no_data"])
+        else:
+            await query.edit_message_text(text=MESSAGES["error"])
     except Exception as e:
         logger.error(f"Button handler error: {e}")
-        await query.message.reply_text(MESSAGES["error"])
+        try:
+            await query.answer(MESSAGES["error"], show_alert=True)
+        except Exception:
+            pass
+        try:
+            await send_message(update, query.message.reply_text, MESSAGES["error"])
+        except Exception:
+            pass
+    finally:
+        state.processing[user_id] = False
 
-# --- Flask Routes ---
-@flask_app.route(settings.WEBHOOK_PATH, methods=["POST"])
+async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not (data := query.data) or not data.startswith("time:"):
+        return
+    time_value = data[5:]
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if user_id not in state.waiting_time_input:
+        try:
+            await query.edit_message_text(text="再度最初からご選択ください。")
+        except Exception:
+            pass
+        return
+    if time_value == "other":
+        try:
+            await context.bot.delete_message(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id
+            )
+        except Exception:
+            pass
+        await send_message(
+            update,
+            update.effective_chat.send_message,
+            MESSAGES["ask_manual_time"],
+            reply_markup=ForceReply(selective=True)
+        )
+        state.waiting_time_input[user_id]["waiting_manual_time"] = True
+    else:
+        await send_to_channel_and_finish(update, context, user_id, time_value)
+
+async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in state.waiting_time_input and state.waiting_time_input[user_id].get("waiting_manual_time"):
+        await send_to_channel_and_finish(update, context, user_id, update.message.text.strip())
+        state.waiting_time_input[user_id].pop("waiting_manual_time", None)
+
+async def send_to_channel_and_finish(update, context, user_id, time_value):
+    if not (info := state.waiting_time_input.pop(user_id, None)):
+        logger.warning(f"No waiting_time_input for user {user_id}")
+        return
+    username = info.get('username')
+    kh_info = (
+        f'<a href="https://t.me/{username}">{info["name"]} (@{username})</a>'
+        if username else
+        f'<a href="tg://user?id={info["user_id"]}">{info["name"]}</a>'
+    )
+    msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=msg,
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        logger.error(f"Channel message error: {e}")
+    await send_message(
+        update,
+        update.effective_message.reply_text,
+        MESSAGES["final_thanks"],
+        parse_mode='HTML'
+    )
+
+# --- Webhook ---
+@app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
-    """Handle Telegram webhook updates"""
     if not application:
         return "Bot not ready", 503
-
     try:
-        if not (data := request.get_json(force=True)):
-            return "Empty request", 400
-
-        async_to_sync(application.process_update)(
-            Update.de_json(data, application.bot)
-        )
+        if data := request.get_json(force=True):
+            update = Update.de_json(data, application.bot)
+            try:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+                else:
+                    loop.run_until_complete(application.process_update(update))
+            except Exception as err:
+                logger.error(f"Loop handling error: {err}")
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return "ok", 200
 
-@flask_app.route("/health")
+@app.route("/health")
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "1.0.0",
-        "data_status": "loaded" if state.data else "empty",
-        "last_refresh": datetime.fromtimestamp(state.last_refresh).isoformat() if state.last_refresh else None,
-        "active_users": len(state.welcomed_users)
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "1.0.0"
     })
 
-# --- Error Handler ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler"""
-    logger.error("Update error:", exc_info=context.error)
-
-# --- Application Startup ---
-async def init_application():
-    """Initialize application"""
+# --- Init ---
+async def init_bot():
     global application
-
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.DEBUG if settings.DEBUG else logging.INFO,
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
     try:
-        # Initialize bot application
-        application = ApplicationBuilder().token(settings.BOT_TOKEN).build()
-
-        # Add handlers
+        application = (
+            ApplicationBuilder()
+            .token(BOT_TOKEN)
+            .concurrent_updates(True)
+            .build()
+        )
         application.add_handler(CommandHandler("start", handle_start))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_manual_time))
+        application.add_handler(CallbackQueryHandler(handle_time_select, pattern="^time:"))
         application.add_handler(CallbackQueryHandler(handle_button))
-        application.add_error_handler(error_handler)
-
-        # Initialize bot and set webhook
         await application.initialize()
-        webhook_url = f"{settings.WEBHOOK_URL}{settings.WEBHOOK_PATH}"
-        await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
-
-        # Load initial data
+        await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
         refresh_data()
         return True
-
     except Exception as e:
-        logger.critical(f"Initialization error: {e}")
+        logger.error(f"Bot initialization error: {e}")
         return False
-
-async def run_application():
-    """Run the application"""
-    try:
-        if await init_application():
-            config = Config()
-            config.bind = [f"0.0.0.0:{settings.PORT}"]
-            await serve(flask_app, config)
-        else:
-            raise RuntimeError("Application initialization failed")
-    except Exception as e:
-        logger.critical(f"Startup error: {e}")
-        raise
 
 if __name__ == '__main__':
     try:
-        asyncio.run(run_application())
+        config = Config()
+        config.bind = [f"0.0.0.0:{PORT}"]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        if not loop.run_until_complete(init_bot()):
+            raise RuntimeError("Failed to initialize bot")
+        loop.run_until_complete(serve(app, config))
     except KeyboardInterrupt:
         logger.info("Shutdown by user")
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
         raise
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
