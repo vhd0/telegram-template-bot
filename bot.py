@@ -28,7 +28,7 @@ MAX_REQUESTS_PER_MINUTE = 30
 MESSAGES = {
     "welcome": (
         "三上はじめにようこそお越しくださいました。ご利用いただき、誠にありがとうございます。\n"
-        "下記の選択肢よりご希望の項目をお選びください。\n\n"
+        "ご希望の場所を以下の選択肢よりお選びください。\n\n"
         "※ボタンを押した後、処理に数秒かかる場合がございます。反応がない場合は再度お試しください。"
     ),
     "processing": "⏳ 現在処理中です。しばらくお待ちください。",
@@ -207,9 +207,9 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'username': update.effective_user.username
                 }
                 times = [
-                    ("08:00", "08:00"), ("09:00", "09:00"), ("10:00", "10:00"),
-                    ("12:00", "12:00"), ("14:00", "14:00"), ("16:00", "16:00"),
-                    ("18:00", "18:00"), ("20:00", "20:00"), ("その他", "other")
+                    ("11:00", "11:00"), ("12:00", "12:00"), ("13:00", "13:00"),
+                    ("14:00", "14:00"), ("16:00", "16:00"), ("18:00", "18:00"),
+                    ("20:00", "20:00"), ("22:00", "22:00"), ("その他", "other")
                 ]
                 keyboard = [[InlineKeyboardButton(label, callback_data=f"time:{t}")] for label, t in times]
                 await query.edit_message_text(
