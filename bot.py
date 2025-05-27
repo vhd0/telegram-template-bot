@@ -17,7 +17,7 @@ from hypercorn.config import Config
 
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8443))
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
 CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
@@ -307,12 +307,18 @@ def webhook_handler():
     try:
         if data := request.get_json(force=True):
             update = Update.de_json(data, application.bot)
-            loop = asyncio.get_event_loop()
-            # Đảm bảo luôn dùng event loop đang chạy của Hypercorn, không được đóng
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
-            else:
-                loop.run_until_complete(application.process_update(update))
+            try:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                if loop.is_running():
+                    asyncio.run_coroutine_threadsafe(application.process_update(update), loop)
+                else:
+                    loop.run_until_complete(application.process_update(update))
+            except Exception as err:
+                logger.error(f"Loop handling error: {err}")
         return "ok", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
