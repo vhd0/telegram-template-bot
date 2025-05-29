@@ -168,6 +168,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("No data to show user at /start")
         return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
     keys = sorted({row["Key"] for row in state.data if row.get("Key")})
+    logger.info(f"DEBUG: All Keys in data: {[row.get('Key') for row in state.data]}")
     keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
     logger.info(f"handle_start: user {user_id} keys={keys}")
     await send_message(
@@ -204,11 +205,19 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
         rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
         logger.info(f"Parsed button: level={level}, key={key}, rep1={rep1}, rep2={rep2}")
+
+        # Debug: Log toàn bộ data
+        logger.info(f"DEBUG: First 10 rows of state.data: {state.data[:10]}")
         if level == "key":
+            debug_rows = [
+                row for row in state.data
+                if norm(row.get("Key")) == norm(key)
+            ]
+            logger.info(f"DEBUG: Có {len(debug_rows)} dòng có Key={key}. Các Rep1: {[row.get('Rep1') for row in debug_rows]}")
             rep1s = sorted({row["Rep1"] for row in state.data if norm(row.get("Key")) == norm(key) and row.get("Rep1")})
             logger.info(f"rep1s for key '{key}': {rep1s}")
+            keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
             if rep1s:
-                keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
                 await query.edit_message_text(
                     text=f"{MESSAGES['selected'].format(key)}\n{MESSAGES['next_step']}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
@@ -217,7 +226,24 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"No rep1 found for key {key}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep1":
-            rep2s = sorted({row["Rep2"] for row in state.data if norm(row.get("Key")) == norm(key) and norm(row.get("Rep1")) == norm(rep1) and row.get("Rep2")})
+            debug_rows = [
+                row for row in state.data
+                if norm(row.get("Key")) == norm(key)
+            ]
+            logger.info(f"DEBUG: Có {len(debug_rows)} dòng có Key={key}")
+            debug_rows2 = [
+                row for row in debug_rows
+                if norm(row.get("Rep1")) == norm(rep1)
+            ]
+            logger.info(f"DEBUG: Có {len(debug_rows2)} dòng có Key={key} và Rep1={rep1}")
+            logger.info(f"DEBUG: rep2 danh sách: {[row.get('Rep2') for row in debug_rows2]}")
+
+            rep2s = sorted({
+                row.get("Rep2", "") for row in state.data
+                if norm(row.get("Key")) == norm(key)
+                   and norm(row.get("Rep1")) == norm(rep1)
+                   and row.get("Rep2")
+            })
             logger.info(f"rep2s for key '{key}', rep1 '{rep1}': {rep2s}")
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
@@ -229,7 +255,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"No rep2 found for key {key}, rep1 {rep1}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep2":
-            # Fix: Dùng so sánh norm để tránh lỗi trùng tên
+            debug_rows = [
+                row for row in state.data
+                if norm(row.get("Key")) == norm(key)
+                   and norm(row.get("Rep1")) == norm(rep1)
+            ]
+            logger.info(f"DEBUG: Có {len(debug_rows)} dòng có Key={key}, Rep1={rep1}, các Rep2: {[row.get('Rep2') for row in debug_rows]}")
             row = next(
                 (
                     row for row in state.data
