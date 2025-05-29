@@ -59,6 +59,10 @@ logger.info(f"PORT: {PORT}")
 logger.info(f"EXCEL_FILE_PATH: {EXCEL_FILE_PATH}")
 logger.info(f"CHANNEL_ID: {CHANNEL_ID}")
 
+# --- Utils ---
+def norm(s):
+    return (s or '').strip().lower()
+
 # --- State Management ---
 class State:
     def __init__(self):
@@ -82,6 +86,7 @@ class State:
         return True
 
     def get_id(self, s: str) -> int:
+        s = (s or "").strip()
         if not s:
             return -1
         if s not in self.string_ids:
@@ -103,7 +108,7 @@ main_loop = None  # GLOBAL event loop
 def load_excel_data():
     logger.info("Loading Excel data...")
     try:
-        import pandas as pd  # Lazy import: chỉ khi thật cần mới import
+        import pandas as pd
         df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         logger.info("Excel data loaded successfully.")
         return df.fillna('').astype(str).to_dict(orient='records')
@@ -121,7 +126,7 @@ def refresh_data():
             state.last_refresh = now
             for row in data:
                 for field in ["Key", "Rep1", "Rep2"]:
-                    if row[field]:
+                    if row.get(field):
                         state.get_id(row[field])
         else:
             logger.warning("No data loaded from Excel.")
@@ -162,7 +167,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state.data:
         logger.warning("No data to show user at /start")
         return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
-    keys = sorted({row["Key"] for row in state.data if row["Key"]})
+    keys = sorted({row["Key"] for row in state.data if row.get("Key")})
     keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
     logger.info(f"handle_start: user {user_id} keys={keys}")
     await send_message(
@@ -191,15 +196,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Could not answer callback query: {e}")
         refresh_data()
-        level, *ids = query.data.split(':')
-        ids = [int(i) if i else -1 for i in ids]
+        parts = query.data.split(':')
+        level = parts[0]
+        ids = [int(i) if i else -1 for i in parts[1:]]
         key_id, rep1_id, rep2_id = ids + [-1] * (3 - len(ids))
         key = state.get_string(key_id)
         rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
         rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
         logger.info(f"Parsed button: level={level}, key={key}, rep1={rep1}, rep2={rep2}")
         if level == "key":
-            rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
+            rep1s = sorted({row["Rep1"] for row in state.data if norm(row.get("Key")) == norm(key) and row.get("Rep1")})
             logger.info(f"rep1s for key '{key}': {rep1s}")
             if rep1s:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
@@ -211,7 +217,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"No rep1 found for key {key}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep1":
-            rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
+            rep2s = sorted({row["Rep2"] for row in state.data if norm(row.get("Key")) == norm(key) and norm(row.get("Rep1")) == norm(rep1) and row.get("Rep2")})
             logger.info(f"rep2s for key '{key}', rep1 '{rep1}': {rep2s}")
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
@@ -223,7 +229,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"No rep2 found for key {key}, rep1 {rep1}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep2":
-            row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
+            # Fix: Dùng so sánh norm để tránh lỗi trùng tên
+            row = next(
+                (
+                    row for row in state.data
+                    if norm(row.get("Key")) == norm(key)
+                    and norm(row.get("Rep1")) == norm(rep1)
+                    and norm(row.get("Rep2")) == norm(rep2)
+                ),
+                None
+            )
             logger.info(f"Selected row for key={key}, rep1={rep1}, rep2={rep2}: {row}")
             if row:
                 state.waiting_time_input[user_id] = {
@@ -308,7 +323,6 @@ async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
         state.waiting_time_input[user_id].pop("waiting_manual_time", None)
 
 async def send_to_channel_and_finish(update, context, user_id, time_value):
-    """Gửi thông tin về channel, xóa các tin nhắn cũ với user, chỉ để lại tin cảm ơn cuối."""
     info = state.waiting_time_input.pop(user_id, None)
     logger.info(f"send_to_channel_and_finish: user={user_id}, info={info}, time_value={time_value}")
     if not info:
@@ -331,10 +345,7 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     except Exception as e:
         logger.error(f"Channel message error: {e}", exc_info=True)
 
-    # XÓA TẤT CẢ TIN NHẮN TRƯỚC
     await delete_messages(update, context)
-
-    # GỬI LẠI CHỈ TIN NHẮN FINAL
     await send_message(
         update,
         update.effective_chat.send_message,
@@ -355,10 +366,9 @@ def webhook_handler():
         logger.info(f"Webhook received data: {data}")
         if data:
             update = Update.de_json(data, application.bot)
-            # Đảm bảo dùng đúng main_loop (loop khởi tạo bot), không tạo loop mới!
             future = asyncio.run_coroutine_threadsafe(application.process_update(update), main_loop)
             try:
-                future.result(timeout=10)  # Có thể bỏ timeout nếu muốn fire-and-forget
+                future.result(timeout=10)
             except Exception as err:
                 logger.error(f"Coroutine error: {err}", exc_info=True)
         return "ok", 200
