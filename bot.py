@@ -53,6 +53,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logger.info(f"BOT_TOKEN: {BOT_TOKEN}")
+logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+logger.info(f"PORT: {PORT}")
+logger.info(f"EXCEL_FILE_PATH: {EXCEL_FILE_PATH}")
+logger.info(f"CHANNEL_ID: {CHANNEL_ID}")
+
 # --- State Management ---
 class State:
     def __init__(self):
@@ -70,6 +76,7 @@ class State:
         now = time.time()
         self._requests[user_id] = [r for r in self._requests[user_id] if now - r < 60]
         if len(self._requests[user_id]) >= MAX_REQUESTS_PER_MINUTE:
+            logger.warning(f"User {user_id} is rate limited.")
             return False
         self._requests[user_id].append(now)
         return True
@@ -94,9 +101,11 @@ main_loop = None  # GLOBAL event loop
 # --- Data Management ---
 @lru_cache(maxsize=1)
 def load_excel_data():
+    logger.info("Loading Excel data...")
     try:
         import pandas as pd  # Lazy import: chỉ khi thật cần mới import
         df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
+        logger.info("Excel data loaded successfully.")
         return df.fillna('').astype(str).to_dict(orient='records')
     except Exception as e:
         logger.error(f"Excel loading error: {e}")
@@ -105,6 +114,7 @@ def load_excel_data():
 def refresh_data():
     now = time.time()
     if now - state.last_refresh > CACHE_TTL:
+        logger.info("Refreshing data cache.")
         load_excel_data.cache_clear()
         if data := load_excel_data():
             state.data = data
@@ -113,9 +123,12 @@ def refresh_data():
                 for field in ["Key", "Rep1", "Rep2"]:
                     if row[field]:
                         state.get_id(row[field])
+        else:
+            logger.warning("No data loaded from Excel.")
 
 # --- Message Handling ---
 async def send_message(update, message_func, text, **kwargs):
+    logger.info(f"send_message: user={getattr(update.effective_user, 'id', None)}, text={text}")
     try:
         msg = await message_func(text=text, **kwargs)
         if msg and hasattr(msg, 'message_id'):
@@ -128,16 +141,18 @@ async def send_message(update, message_func, text, **kwargs):
 async def delete_messages(update, context):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    logger.info(f"delete_messages: user={user_id}, chat_id={chat_id}, msgs={state.user_message_ids[user_id]}")
     for msg_id in state.user_message_ids[user_id]:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not delete message {msg_id} for user {user_id}: {e}")
     state.user_message_ids[user_id].clear()
 
 # --- Handlers ---
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"handle_start: from user {user_id}")
     if not state.can_request(user_id):
         return await send_message(update, update.message.reply_text, MESSAGES["rate_limit"])
     state.processing[user_id] = False
@@ -145,9 +160,11 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_messages(update, context)
     refresh_data()
     if not state.data:
+        logger.warning("No data to show user at /start")
         return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
     keys = sorted({row["Key"] for row in state.data if row["Key"]})
     keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
+    logger.info(f"handle_start: user {user_id} keys={keys}")
     await send_message(
         update,
         update.message.reply_text,
@@ -159,18 +176,20 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+    logger.info(f"handle_button: from user {user_id}, data={query.data}")
     if not state.can_request(user_id) or state.processing.get(user_id):
         try:
+            logger.info(f"handle_button: user {user_id} is rate limited or processing.")
             await query.answer(MESSAGES["processing"], show_alert=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"handle_button: Could not answer query: {e}")
         return
     try:
         state.processing[user_id] = True
         try:
             await query.answer()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not answer callback query: {e}")
         refresh_data()
         level, *ids = query.data.split(':')
         ids = [int(i) if i else -1 for i in ids]
@@ -178,8 +197,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = state.get_string(key_id)
         rep1 = state.get_string(rep1_id) if rep1_id != -1 else ''
         rep2 = state.get_string(rep2_id) if rep2_id != -1 else ''
+        logger.info(f"Parsed button: level={level}, key={key}, rep1={rep1}, rep2={rep2}")
         if level == "key":
             rep1s = sorted({row["Rep1"] for row in state.data if row["Key"] == key and row["Rep1"]})
+            logger.info(f"rep1s for key '{key}': {rep1s}")
             if rep1s:
                 keyboard = [[InlineKeyboardButton(r1, callback_data=f"rep1:{key_id}:{state.get_id(r1)}:")] for r1 in rep1s]
                 await query.edit_message_text(
@@ -187,9 +208,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
+                logger.info(f"No rep1 found for key {key}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep1":
             rep2s = sorted({row["Rep2"] for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"]})
+            logger.info(f"rep2s for key '{key}', rep1 '{rep1}': {rep2s}")
             if rep2s:
                 keyboard = [[InlineKeyboardButton(r2, callback_data=f"rep2:{key_id}:{rep1_id}:{state.get_id(r2)}")] for r2 in rep2s]
                 await query.edit_message_text(
@@ -197,9 +220,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
+                logger.info(f"No rep2 found for key {key}, rep1 {rep1}")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         elif level == "rep2":
             row = next((row for row in state.data if row["Key"] == key and row["Rep1"] == rep1 and row["Rep2"] == rep2), None)
+            logger.info(f"Selected row for key={key}, rep1={rep1}, rep2={rep2}: {row}")
             if row:
                 state.waiting_time_input[user_id] = {
                     'rep3': row.get("Rep3", ""),
@@ -220,11 +245,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='HTML'
                 )
             else:
+                logger.info("No matching row found for rep2 selection.")
                 await query.edit_message_text(text=MESSAGES["no_data"])
         else:
+            logger.warning(f"Unknown callback level: {level}")
             await query.edit_message_text(text=MESSAGES["error"])
     except Exception as e:
-        logger.error(f"Button handler error: {e}")
+        logger.error(f"Button handler error: {e}", exc_info=True)
         try:
             await query.answer(MESSAGES["error"], show_alert=True)
         except Exception:
@@ -239,14 +266,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+    logger.info(f"handle_time_select: user={user_id}, data={query.data}")
     if not (data := query.data) or not data.startswith("time:"):
+        logger.warning("handle_time_select: data invalid or missing")
         return
     time_value = data[5:]
     try:
         await query.answer()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not answer time select: {e}")
     if user_id not in state.waiting_time_input:
+        logger.warning(f"time_select: user {user_id} not in waiting_time_input")
         try:
             await query.edit_message_text(text="再度最初からご選択ください。")
         except Exception:
@@ -258,8 +288,8 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=query.message.chat.id,
                 message_id=query.message.message_id
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not delete message for manual time input: {e}")
         await send_message(
             update,
             update.effective_chat.send_message,
@@ -272,6 +302,7 @@ async def handle_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"handle_manual_time: user={user_id}, text={getattr(update.message, 'text', '')}")
     if user_id in state.waiting_time_input and state.waiting_time_input[user_id].get("waiting_manual_time"):
         await send_to_channel_and_finish(update, context, user_id, update.message.text.strip())
         state.waiting_time_input[user_id].pop("waiting_manual_time", None)
@@ -279,6 +310,7 @@ async def handle_manual_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def send_to_channel_and_finish(update, context, user_id, time_value):
     """Gửi thông tin về channel, xóa các tin nhắn cũ với user, chỉ để lại tin cảm ơn cuối."""
     info = state.waiting_time_input.pop(user_id, None)
+    logger.info(f"send_to_channel_and_finish: user={user_id}, info={info}, time_value={time_value}")
     if not info:
         logger.warning(f"No waiting_time_input for user {user_id}")
         return
@@ -290,13 +322,14 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
     )
     msg = f'{info["rep3"]} - {info["rep4"]} - {kh_info} - {time_value}'
     try:
+        logger.info(f"Sending message to channel {CHANNEL_ID}: {msg}")
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=msg,
             parse_mode='HTML'
         )
     except Exception as e:
-        logger.error(f"Channel message error: {e}")
+        logger.error(f"Channel message error: {e}", exc_info=True)
 
     # XÓA TẤT CẢ TIN NHẮN TRƯỚC
     await delete_messages(update, context)
@@ -313,31 +346,36 @@ async def send_to_channel_and_finish(update, context, user_id, time_value):
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook_handler():
     global main_loop
+    logger.info(f"Webhook called at {WEBHOOK_PATH}")
     if not application or not main_loop:
+        logger.error("Bot not ready: application or main_loop is None")
         return "Bot not ready", 503
     try:
-        if data := request.get_json(force=True):
+        data = request.get_json(force=True)
+        logger.info(f"Webhook received data: {data}")
+        if data:
             update = Update.de_json(data, application.bot)
             # Đảm bảo dùng đúng main_loop (loop khởi tạo bot), không tạo loop mới!
             future = asyncio.run_coroutine_threadsafe(application.process_update(update), main_loop)
             try:
                 future.result(timeout=10)  # Có thể bỏ timeout nếu muốn fire-and-forget
             except Exception as err:
-                logger.error(f"Coroutine error: {err}")
+                logger.error(f"Coroutine error: {err}", exc_info=True)
         return "ok", 200
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return "ok", 200
 
 @app.route("/health")
 def health_check():
-    # Endpoint cực nhẹ, không load gì cả
+    logger.info("Health check endpoint called.")
     return jsonify({"status": "ok"})
 
 # --- Init ---
 async def init_bot():
     global application, main_loop
     try:
+        logger.info("Initializing Telegram Application...")
         application = (
             ApplicationBuilder()
             .token(BOT_TOKEN)
@@ -349,11 +387,14 @@ async def init_bot():
         application.add_handler(CallbackQueryHandler(handle_time_select, pattern="^time:"))
         application.add_handler(CallbackQueryHandler(handle_button))
         await application.initialize()
-        await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+        logger.info(f"Setting webhook: {WEBHOOK_URL}{WEBHOOK_PATH}")
+        webhook_result = await application.bot.set_webhook(url=f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+        logger.info(f"set_webhook result: {webhook_result}")
         main_loop = asyncio.get_running_loop()
+        logger.info("Telegram Application initialized successfully.")
         return True
     except Exception as e:
-        logger.error(f"Bot initialization error: {e}")
+        logger.error(f"Bot initialization error: {e}", exc_info=True)
         return False
 
 # --- Main Entrypoint ---
@@ -361,18 +402,22 @@ if __name__ == '__main__':
     try:
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
+        logger.info(f"Starting Hypercorn on {config.bind}")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        logger.info("Event loop created, initializing bot...")
         if not loop.run_until_complete(init_bot()):
+            logger.critical("Failed to initialize bot")
             raise RuntimeError("Failed to initialize bot")
+        logger.info("Bot initialized, starting Hypercorn server...")
         loop.run_until_complete(serve(app, config))
     except KeyboardInterrupt:
         logger.info("Shutdown by user")
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}", exc_info=True)
         raise
     finally:
         try:
             loop.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Could not close loop: {e}")
