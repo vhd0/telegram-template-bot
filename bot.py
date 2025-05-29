@@ -1,11 +1,11 @@
 import logging
 import os
 import asyncio
-import pandas as pd
 import time
 from collections import defaultdict
 from functools import lru_cache
 from datetime import datetime
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -95,6 +95,7 @@ main_loop = None  # GLOBAL event loop
 @lru_cache(maxsize=1)
 def load_excel_data():
     try:
+        import pandas as pd  # Lazy import: chỉ khi thật cần mới import
         df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=[''])
         return df.fillna('').astype(str).to_dict(orient='records')
     except Exception as e:
@@ -330,11 +331,8 @@ def webhook_handler():
 
 @app.route("/health")
 def health_check():
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "version": "1.0.0"
-    })
+    # Endpoint cực nhẹ, không load gì cả
+    return jsonify({"status": "ok"})
 
 # --- Init ---
 async def init_bot():
