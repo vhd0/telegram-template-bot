@@ -34,6 +34,8 @@ def csv_to_sqlite(csv_file, db_file, table_name):
             # Lấy chỉ các cột hợp lệ
             clean_row = [row[i] if i < len(row) else "" for i in indices]
             rows.append(clean_row)
+    if not headers:
+        raise Exception("No valid headers found in CSV. Please check your file.")
     conn = sqlite3.connect(db_file)
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {table_name}")
