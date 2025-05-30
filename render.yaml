@@ -13,8 +13,8 @@ services:
         sync: false
       - key: PORT
         value: 8443
-      - key: EXCEL_FILE_PATH
-        value: rep.xlsx
+      - key: CSV_FILE_PATH
+        value: rep.csv
       - key: MAX_REQUESTS_PER_MINUTE
         value: 30
       - key: CACHE_TTL
