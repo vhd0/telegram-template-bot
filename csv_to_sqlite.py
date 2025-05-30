@@ -2,33 +2,48 @@ import csv
 import sqlite3
 import os
 
-CSV_FILE = "rep.csv"         # Đường dẫn file CSV đã sync từ GitHub
-DB_FILE = "rep.db"           # Tên file SQLite DB sẽ tạo/cập nhật
-TABLE_NAME = "rep"           # Tên bảng trong DB
+CSV_FILE = "rep.csv"
+DB_FILE = "rep.db"
+TABLE_NAME = "rep"
+
+def sanitize_headers(headers):
+    seen = {}
+    new_headers = []
+    indices = []
+    for idx, h in enumerate(headers):
+        h = h.strip()
+        if not h:
+            continue  # Bỏ qua cột không tên
+        orig_h = h
+        i = 1
+        while h in seen:
+            h = f"{orig_h}_{i}"
+            i += 1
+        seen[h] = True
+        new_headers.append(h)
+        indices.append(idx)
+    return new_headers, indices
 
 def csv_to_sqlite(csv_file, db_file, table_name):
-    # Đọc tiêu đề cột từ CSV
     with open(csv_file, newline='', encoding='utf-8') as f:
         reader = csv.reader(f)
-        headers = next(reader)
-        rows = list(reader)
-    
-    # Tạo kết nối đến SQLite
+        raw_headers = next(reader)
+        headers, indices = sanitize_headers(raw_headers)
+        rows = []
+        for row in reader:
+            # Lấy chỉ các cột hợp lệ
+            clean_row = [row[i] if i < len(row) else "" for i in indices]
+            rows.append(clean_row)
     conn = sqlite3.connect(db_file)
     cur = conn.cursor()
-
-    # Tạo bảng mới (nếu tồn tại thì xóa đi tạo lại)
     cur.execute(f"DROP TABLE IF EXISTS {table_name}")
     col_defs = ', '.join(f'"{h}" TEXT' for h in headers)
     cur.execute(f'CREATE TABLE {table_name} ({col_defs})')
-
-    # Insert dữ liệu
     placeholders = ', '.join('?' for _ in headers)
     cur.executemany(
         f'INSERT INTO {table_name} VALUES ({placeholders})',
         rows
     )
-
     conn.commit()
     conn.close()
     print(f"Đã nạp dữ liệu từ {csv_file} vào {db_file}:{table_name}")
