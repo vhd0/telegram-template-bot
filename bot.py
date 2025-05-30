@@ -13,12 +13,15 @@ from telegram.ext import (
 from flask import Flask, request, jsonify
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
+import sqlite3
+import csv
 
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.getenv("PORT", 8443))
-EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "rep.xlsx")
+CSV_FILE_PATH = os.getenv("CSV_FILE_PATH", "rep.csv")
+SQLITE_FILE_PATH = os.getenv("SQLITE_FILE_PATH", "rep.db")
 CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
 WEBHOOK_PATH = "/webhook_telegram"
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-1002647531334")
@@ -94,27 +97,49 @@ app = Flask(__name__)
 application = None
 main_loop = None
 
-# --- Data ---
-@lru_cache(maxsize=1)
-def load_excel_data():
-    try:
-        import pandas as pd
-        df = pd.read_excel(EXCEL_FILE_PATH, engine='openpyxl', na_values=['', '#ERROR', '#VALUE!', '#REF!', '#DIV/0!'])
-        df = df.fillna('').astype(str)
-        df = df[~df.apply(lambda row: any('#ERROR' in str(cell) for cell in row), axis=1)]
-        return df.to_dict(orient='records')
-    except Exception as e:
-        logger.error(f"Excel loading error: {e}")
-        return []
+# --- CSV to SQLite ---
+def csv_to_sqlite(csv_file, db_file, table_name="rep"):
+    if not os.path.exists(csv_file):
+        logger.error(f"Không tìm thấy file CSV: {csv_file}")
+        return
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        rows = list(reader)
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+    col_defs = ', '.join(f'"{h}" TEXT' for h in headers)
+    cur.execute(f'CREATE TABLE {table_name} ({col_defs})')
+    placeholders = ', '.join('?' for _ in headers)
+    cur.executemany(
+        f'INSERT INTO {table_name} VALUES ({placeholders})',
+        rows
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Đã nạp dữ liệu từ {csv_file} vào {db_file}:{table_name}")
 
+def load_data_from_sqlite(db_file, table_name="rep"):
+    if not os.path.exists(db_file):
+        logger.error(f"Không tìm thấy file DB: {db_file}")
+        return []
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute(f"SELECT * FROM {table_name}")
+    columns = [col[0] for col in cur.description]
+    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+# --- Data ---
 def refresh_data():
     now = time.time()
     if now - state.last_refresh > CACHE_TTL:
-        load_excel_data.cache_clear()
-        data = load_excel_data()
-        state.data = data
+        # Chỉ cần load từ SQLite, không cần lru_cache
+        state.data = load_data_from_sqlite(SQLITE_FILE_PATH, "rep")
         state.last_refresh = now
-        for row in data:
+        for row in state.data:
             for field in ["Key", "Rep1", "Rep2"]:
                 if row.get(field):
                     state.get_id(row[field])
@@ -148,18 +173,25 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.processing[user_id] = False
     state.waiting_time_input.pop(user_id, None)
     await delete_messages(update, context)
-    refresh_data()
-    if not state.data:
-        return await send_message(update, update.message.reply_text, MESSAGES["no_data"])
-    keys = sorted({row["Key"] for row in state.data if row.get("Key")})
-    keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
-    await send_message(
-        update,
-        update.message.reply_text,
-        MESSAGES["welcome"],
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='HTML'
+    # Gửi phản hồi nhanh trước
+    loading_msg = await send_message(
+        update, update.message.reply_text, "⏳ Đang tải dữ liệu, vui lòng chờ trong giây lát..."
     )
+    # Xử lý chậm phía sau
+    try:
+        refresh_data()
+        if not state.data:
+            await loading_msg.edit_text(MESSAGES["no_data"])
+            return
+        keys = sorted({row["Key"] for row in state.data if row.get("Key")})
+        keyboard = [[InlineKeyboardButton(k, callback_data=f"key:{state.get_id(k)}::")] for k in keys]
+        await loading_msg.edit_text(
+            MESSAGES["welcome"],
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+    except Exception:
+        await loading_msg.edit_text(MESSAGES["error"])
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -345,6 +377,9 @@ async def init_bot():
         return False
 
 if __name__ == '__main__':
+    # Khởi động: tự động chuyển CSV sang SQLite nếu file csv mới
+    if os.path.exists(CSV_FILE_PATH):
+        csv_to_sqlite(CSV_FILE_PATH, SQLITE_FILE_PATH, "rep")
     try:
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
