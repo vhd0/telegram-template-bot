@@ -187,7 +187,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await delete_messages(update, context)
     # Gửi phản hồi nhanh để UX tốt hơn
     loading_msg = await send_message(
-        update, update.message.reply_text, "⏳ Đang tải dữ liệu, vui lòng chờ trong giây lát..."
+        update, update.message.reply_text, "⏳ 現在処理中です。しばらくお待ちください。。。"
     )
     # Xử lý chậm phía sau
     try:
