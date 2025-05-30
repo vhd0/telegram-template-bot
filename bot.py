@@ -3,7 +3,6 @@ import os
 import asyncio
 import time
 from collections import defaultdict
-from functools import lru_cache
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
@@ -102,23 +101,37 @@ def csv_to_sqlite(csv_file, db_file, table_name="rep"):
     if not os.path.exists(csv_file):
         logger.error(f"Không tìm thấy file CSV: {csv_file}")
         return
-    with open(csv_file, newline='', encoding='utf-8') as f:
+    with open(csv_file, newline='', encoding='utf-8-sig') as f:
         reader = csv.reader(f)
         headers = next(reader)
+        # Bảo vệ: nếu có header rỗng, đặt tên tự động
+        seen = {}
+        clean_headers = []
+        for idx, h in enumerate(headers):
+            h = h.strip()
+            if not h:
+                h = f"_col{idx+1}"
+            orig_h = h
+            i = 1
+            while h in seen:
+                h = f"{orig_h}_{i}"
+                i += 1
+            seen[h] = True
+            clean_headers.append(h)
         rows = list(reader)
     conn = sqlite3.connect(db_file)
     cur = conn.cursor()
     cur.execute(f"DROP TABLE IF EXISTS {table_name}")
-    col_defs = ', '.join(f'"{h}" TEXT' for h in headers)
+    col_defs = ', '.join(f'"{h}" TEXT' for h in clean_headers)
     cur.execute(f'CREATE TABLE {table_name} ({col_defs})')
-    placeholders = ', '.join('?' for _ in headers)
+    placeholders = ', '.join('?' for _ in clean_headers)
     cur.executemany(
         f'INSERT INTO {table_name} VALUES ({placeholders})',
         rows
     )
     conn.commit()
     conn.close()
-    logger.info(f"Đã nạp dữ liệu từ {csv_file} vào {db_file}:{table_name}")
+    logger.info(f"Đã nạp dữ liệu từ {csv_file} vào {db_file}:{table_name} ({len(rows)} rows, {len(clean_headers)} columns)")
 
 def load_data_from_sqlite(db_file, table_name="rep"):
     if not os.path.exists(db_file):
@@ -136,12 +149,11 @@ def load_data_from_sqlite(db_file, table_name="rep"):
 def refresh_data():
     now = time.time()
     if now - state.last_refresh > CACHE_TTL:
-        # Chỉ cần load từ SQLite, không cần lru_cache
         state.data = load_data_from_sqlite(SQLITE_FILE_PATH, "rep")
         state.last_refresh = now
         for row in state.data:
             for field in ["Key", "Rep1", "Rep2"]:
-                if row.get(field):
+                if field in row and row.get(field):
                     state.get_id(row[field])
 
 # --- Telegram ---
@@ -173,7 +185,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.processing[user_id] = False
     state.waiting_time_input.pop(user_id, None)
     await delete_messages(update, context)
-    # Gửi phản hồi nhanh trước
+    # Gửi phản hồi nhanh để UX tốt hơn
     loading_msg = await send_message(
         update, update.message.reply_text, "⏳ Đang tải dữ liệu, vui lòng chờ trong giây lát..."
     )
@@ -190,7 +202,8 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='HTML'
         )
-    except Exception:
+    except Exception as e:
+        logger.error(f"Start handler error: {e}", exc_info=True)
         await loading_msg.edit_text(MESSAGES["error"])
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
