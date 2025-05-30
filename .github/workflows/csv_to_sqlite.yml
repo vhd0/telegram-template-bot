@@ -18,29 +18,32 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run CSV to SQLite conversion
+      - name: Create csv_to_sqlite.py
         run: |
-          python -c "
-import csv, sqlite3, os
-csv_file = 'rep.csv'
-db_file = 'rep.db'
-if not os.path.exists(csv_file):
-    raise SystemExit(f'Không tìm thấy file {csv_file}')
-with open(csv_file, newline='', encoding='utf-8') as f:
-    reader = csv.reader(f)
-    headers = next(reader)
-    rows = list(reader)
-conn = sqlite3.connect(db_file)
-cur = conn.cursor()
-cur.execute(f'DROP TABLE IF EXISTS rep')
-col_defs = ', '.join(f'\"{{h}}\" TEXT' for h in headers)
-cur.execute(f'CREATE TABLE rep ({col_defs})')
-placeholders = ', '.join('?' for _ in headers)
-cur.executemany(f'INSERT INTO rep VALUES ({placeholders})', rows)
-conn.commit()
-conn.close()
-print(f'Dã nạp dữ liệu từ {csv_file} vào {db_file}:rep')
-"
+          cat <<EOF > csv_to_sqlite.py
+          import csv, sqlite3, os
+          csv_file = 'rep.csv'
+          db_file = 'rep.db'
+          if not os.path.exists(csv_file):
+              raise SystemExit(f'Không tìm thấy file {csv_file}')
+          with open(csv_file, newline='', encoding='utf-8') as f:
+              reader = csv.reader(f)
+              headers = next(reader)
+              rows = list(reader)
+          conn = sqlite3.connect(db_file)
+          cur = conn.cursor()
+          cur.execute(f'DROP TABLE IF EXISTS rep')
+          col_defs = ', '.join(f'"{h}" TEXT' for h in headers)
+          cur.execute(f'CREATE TABLE rep ({col_defs})')
+          placeholders = ', '.join('?' for _ in headers)
+          cur.executemany(f'INSERT INTO rep VALUES ({placeholders})', rows)
+          conn.commit()
+          conn.close()
+          print(f'Đã nạp dữ liệu từ {csv_file} vào {db_file}:rep')
+          EOF
+
+      - name: Run CSV to SQLite conversion
+        run: python csv_to_sqlite.py
 
       - name: Commit and push rep.db
         run: |
