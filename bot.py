@@ -18,7 +18,8 @@ import csv
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", 8443))
+# TỐI ƯU: Lấy PORT từ biến môi trường, mặc định 10000 (chuẩn của Render)
+PORT = int(os.getenv("PORT", 10000))
 CSV_FILE_PATH = os.getenv("CSV_FILE_PATH", "rep.csv")
 SQLITE_FILE_PATH = os.getenv("SQLITE_FILE_PATH", "rep.db")
 CACHE_TTL = int(os.getenv("CACHE_TTL", 300))
@@ -543,12 +544,16 @@ async def init_bot():
 if __name__ == '__main__':
     # Khởi động: tự động chuyển CSV sang SQLite nếu file csv mới
     if os.path.exists(CSV_FILE_PATH):
-        csv_to_sqlite(CSV_FILE_PATH, SQLITE_FILE_PATH, "rep")
-    
+        try:
+            csv_to_sqlite(CSV_FILE_PATH, SQLITE_FILE_PATH, "rep")
+        except Exception as e:
+            logger.critical(f"CSV to SQLite failed: {e}", exc_info=True)
+            raise
+
     try:
         config = Config()
-        config.bind = [f"0.0.0.0:{PORT}"]
-        
+        config.bind = [f"0.0.0.0:{PORT}"]  # LUÔN luôn dùng đúng cổng do Render truyền vào
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
