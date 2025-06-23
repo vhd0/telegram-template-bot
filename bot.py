@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import asyncio
 import time
 import sqlite3
@@ -35,8 +36,8 @@ MESSAGES = {
     "processing": "⏳ 現在処理中です。しばらくお待ちください。",
     "next_step": "次の項目をお選びください。",
     "selected": "ご選択いただいた項目：{}",
-    "no_data": "申し訳ございませんが、現在ご案内可能なデータがございません。",
-    "rate_limit": "リクエストが多すぎます。しばらく経ってから再度お試しください。",
+    "no_data": "申し訳ございませんが、現在ご案内可能なデータがございません.",
+    "rate_limit": "リクエスト quá nhiều. Vui lòng thử lại sau.",
     "error": "エラーが発生しました。お手数ですが、もう一度お試しください。",
     "ask_time": "ご到着予定時刻をお知らせください。（下記より選択、または「その他」の場合はご入力ください）",
     "ask_manual_time": "ご到着予定時刻を「HH:MM」形式でご入力くださいませ。",
@@ -165,7 +166,7 @@ def csv_to_sqlite(csv_file, db_file, table_name="rep"):
                 i += 1
             seen[h] = True
             clean_headers.append(h)
-        rows = list(reader)
+        rows = [ [cell.strip() for cell in row] for row in reader ]
 
     conn = sqlite3.connect(db_file)
     cur = conn.cursor()
@@ -467,7 +468,7 @@ if __name__ == '__main__':
             csv_to_sqlite(CSV_FILE_PATH, SQLITE_FILE_PATH, "rep")
         except Exception as e:
             logger.critical(f"CSV to SQLite failed: {e}", exc_info=True)
-            raise
+            sys.exit(1)
     try:
         config = Config()
         config.bind = [f"0.0.0.0:{PORT}"]
