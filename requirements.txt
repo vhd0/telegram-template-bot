@@ -1,4 +1,5 @@
-flask
-transformers
+flask==3.1.1
+transformers==4.30.2
 torch==2.0.1+cpu
+requests==2.31.0
 --extra-index-url https://download.pytorch.org/whl/cpu
