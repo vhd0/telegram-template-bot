@@ -1,102 +1,113 @@
-from flask import Flask, request
 import os
 import requests
+from flask import Flask, request, jsonify
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from langdetect import detect
-from langdetect.lang_detect_exception import LangDetectException
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-HF_API_URL_TEMPLATE = "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-{src}-{tgt}"
+# === Config ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 
+# === Flask App ===
 app = Flask(__name__)
+bot = Bot(token=TELEGRAM_TOKEN)
 
+# === Telegram Handlers ===
+application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+
+# === Translation Logic ===
+def translate_text(text, src, tgt):
+    model_id = f"opus-mt-{src}-{tgt}"
+    model_url = f"https://api-inference.huggingface.co/models/Helsinki-NLP/{model_id}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"inputs": text}
+
+    try:
+        print(f"[Translation] Requesting model: {model_id}")
+        print(f"[Translation] Text: {text}")
+
+        response = requests.post(model_url, headers=headers, json=payload, timeout=15)
+        print(f"[Translation] Status Code: {response.status_code}")
+        print(f"[Translation] Response: {response.text}")
+
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list) and "translation_text" in data[0]:
+                return data[0]["translation_text"]
+            else:
+                print("[Translation] Unexpected response structure.")
+        elif response.status_code == 503:
+            return "⏳ Mô hình đang khởi động, vui lòng thử lại sau vài giây."
+        else:
+            print("[Translation] API Error:", response.text)
+    except Exception as e:
+        print("[Translation] Exception:", str(e))
+
+    return "⚠️ Lỗi khi dịch văn bản."
+
+
+# === Telegram Bot Handlers ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Xin chào! Gửi tôi một đoạn tiếng Anh hoặc tiếng Việt để tôi dịch cho bạn.")
+
+
+async def translate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    try:
+        detected_lang = detect(user_text)
+        print(f"[Detect] Text: {user_text} | Detected: {detected_lang}")
+
+        if detected_lang.startswith('en'):
+            src, tgt = "en", "vi"
+        elif detected_lang.startswith('vi'):
+            src, tgt = "vi", "en"
+        else:
+            await update.message.reply_text("⚠️ Không nhận diện được ngôn ngữ hoặc không hỗ trợ.")
+            return
+
+        translated = translate_text(user_text, src, tgt)
+        await update.message.reply_text(f"🔁 Dịch ({src} → {tgt}):\n{translated}")
+
+    except Exception as e:
+        print("[Translate Message] Error:", e)
+        await update.message.reply_text("⚠️ Lỗi khi xử lý văn bản.")
+
+
+# === Register Telegram Handlers ===
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_message))
+
+
+# === Flask Routes ===
 @app.route("/")
-def index():
-    return "Telegram Translation Bot is running!"
+def home():
+    return "🤖 Telegram Translation Bot is up."
 
 @app.route("/health")
 def health():
-    return "OK", 200
+    return jsonify(status="ok")
 
 @app.route("/webhook_telegram", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    print("[Webhook received]", data)
-
-    if "message" not in data or "text" not in data["message"]:
-        print("No valid message")
-        return "ok"
-
-    chat_id = data["message"]["chat"]["id"]
-    user_text = data["message"]["text"].strip()
-
-    # Xử lý lệnh /start
-    if user_text.lower() == "/start":
-        send_message(chat_id, "👋 Chào mừng bạn đến với bot dịch tự động!\nGửi văn bản bằng tiếng Việt hoặc tiếng Anh để được dịch.")
-        return "ok"
-
-    # Nhận diện ngôn ngữ
+def webhook_telegram():
     try:
-        detected_lang = detect(user_text)
-        print(f"[LangDetect] Text: {user_text} | Detected: {detected_lang}")
-    except LangDetectException:
-        send_message(chat_id, "⚠️ Không thể nhận diện ngôn ngữ. Vui lòng thử lại.")
-        return "ok"
-
-    # Xác định hướng dịch
-    if detected_lang == "vi":
-        src, tgt = "vi", "en"
-    elif detected_lang == "en":
-        src, tgt = "en", "vi"
-    else:
-        send_message(chat_id, f"⚠️ Ngôn ngữ không được hỗ trợ: `{detected_lang}`.")
-        return "ok"
-
-    # Dịch văn bản
-    translation = translate_text(user_text, src, tgt)
-    if translation:
-        send_message(chat_id, f"📤 Dịch ({src} → {tgt}):\n{translation}")
-    else:
-        send_message(chat_id, "⚠️ Lỗi khi dịch văn bản.")
-
-    return "ok"
-
-
-def translate_text(text, src, tgt):
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {"inputs": text}
-    model_url = HF_API_URL_TEMPLATE.format(src=src, tgt=tgt)
-
-    try:
-        print(f"[Translation API] Requesting: {model_url} | Text: {text}")
-        response = requests.post(model_url, headers=headers, json=payload, timeout=10)
-        print("[Translation API] Status:", response.status_code)
-        print("[Translation API] Response:", response.text)
-
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0 and "translation_text" in result[0]:
-                return result[0]["translation_text"]
-        else:
-            print("Translation API Error:", response.text)
+        update = Update.de_json(request.get_json(force=True), bot)
+        print("[Webhook] Incoming update:", update)
+        application.create_task(application.process_update(update))
     except Exception as e:
-        print("Exception during translation:", str(e))
-
-    return None
-
-
-def send_message(chat_id, text):
-    url = f"{TELEGRAM_API_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        r = requests.post(url, json=payload)
-        print("[SendMessage] Status:", r.status_code)
-        print("[SendMessage] Response:", r.text)
-    except Exception as e:
-        print("[SendMessage] Exception:", str(e))
+        print("[Webhook Error]", str(e))
+    return "OK", 200
 
 
+# === Main Runner ===
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    PORT = int(os.environ.get("PORT", 10000))
+    print(f"Starting Flask app on port {PORT}...")
+    app.run(host="0.0.0.0", port=PORT)
