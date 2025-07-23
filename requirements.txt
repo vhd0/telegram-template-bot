@@ -1,3 +1,4 @@
-flask
-requests
-langdetect
+flask==2.3.3
+python-telegram-bot==20.8
+langdetect==1.0.9
+requests==2.32.3
