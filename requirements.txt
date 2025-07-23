@@ -1,8 +1,7 @@
-flask==3.1.1
+python-telegram-bot==20.8
 transformers==4.30.2
 torch==2.0.1+cpu
-requests==2.31.0
 sentencepiece==0.1.99
 langdetect==1.0.9
-python-telegram-bot==20.8
+huggingface_hub==0.23.2
 --extra-index-url https://download.pytorch.org/whl/cpu
