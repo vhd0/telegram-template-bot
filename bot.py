@@ -1,79 +1,79 @@
+from flask import Flask, request
 import os
-import logging
-import asyncio
-from flask import Flask, request, jsonify
-from telegram import Update, Bot
-from telegram.ext import Application, MessageHandler, ContextTypes, CommandHandler, filters
-
-from transformers import MarianMTModel, MarianTokenizer, pipeline
+import requests
 from langdetect import detect
-import torch
 
-# =======================
-# CONFIG & INIT
-# =======================
-TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Set in Render Environment
-bot = Bot(token=TOKEN)
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN")  # bạn cần token từ Hugging Face (miễn phí)
+HF_API_URL_TEMPLATE = "https://api-inference.huggingface.co/models/Helsinki-NLP/opus-mt-{src}-{tgt}"
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# =======================
-# LOAD MODEL
-# =======================
-DEVICE = 0 if torch.cuda.is_available() else -1
 
-model_name = "Helsinki-NLP/opus-mt-ROMANCE-en"
-tokenizer = MarianTokenizer.from_pretrained(model_name)
-model = MarianMTModel.from_pretrained(model_name)
-translator = pipeline("translation", model=model, tokenizer=tokenizer, device=DEVICE)
-
-# =======================
-# HANDLERS
-# =======================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text="👋 Xin chào! Gửi cho tôi đoạn văn bản và tôi sẽ dịch sang tiếng Anh!")
-
-async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = update.message.text.strip()
-        lang = detect(text)
-
-        await update.message.reply_text("⏳ Đang dịch, vui lòng chờ...")
-
-        if lang == "en":
-            response = "✅ Văn bản đã là tiếng Anh."
-        else:
-            result = translator(text, max_length=400)[0]["translation_text"]
-            response = f"🈶 Bản dịch:\n\n{result}"
-
-        await update.message.reply_text(response)
-
-    except Exception as e:
-        logging.error(f"Lỗi dịch: {e}")
-        await update.message.reply_text("❌ Xin lỗi, đã có lỗi xảy ra khi dịch.")
-
-# =======================
-# APPLICATION
-# =======================
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate))
-
-# =======================
-# FLASK ROUTES
-# =======================
 @app.route("/")
 def index():
-    return "✅ Bot is running."
+    return "Telegram Translation Bot is up!"
+
 
 @app.route("/health")
 def health():
-    return jsonify(status="ok")
+    return "OK", 200
+
 
 @app.route("/webhook_telegram", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    asyncio.run(application.process_update(update))
-    return jsonify({"ok": True})
+    data = request.get_json()
+
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        user_text = data["message"]["text"]
+
+        try:
+            detected_lang = detect(user_text)
+        except:
+            detected_lang = "unknown"
+
+        if detected_lang == "vi":
+            src, tgt = "vi", "en"
+        elif detected_lang == "en":
+            src, tgt = "en", "vi"
+        else:
+            send_message(chat_id, "❌ Không nhận diện được ngôn ngữ.")
+            return "ok"
+
+        translation = translate_text(user_text, src, tgt)
+        if translation:
+            send_message(chat_id, f"🈯 Dịch ({src}→{tgt}): {translation}")
+        else:
+            send_message(chat_id, "⚠️ Không thể dịch nội dung.")
+
+    return "ok"
+
+
+def translate_text(text, src, tgt):
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    payload = {"inputs": text}
+    model_url = HF_API_URL_TEMPLATE.format(src=src, tgt=tgt)
+
+    try:
+        response = requests.post(model_url, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            return result[0]["translation_text"]
+        else:
+            print("API error:", response.status_code, response.text)
+    except Exception as e:
+        print("Translation error:", e)
+    return None
+
+
+def send_message(chat_id, text):
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    requests.post(url, json=payload)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
