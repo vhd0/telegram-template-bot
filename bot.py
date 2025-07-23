@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request, jsonify
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, filters
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from langdetect import detect
 import requests
 
@@ -14,11 +14,9 @@ if not TELEGRAM_TOKEN or not HF_API_TOKEN:
     raise ValueError("Missing TELEGRAM_TOKEN or HF_API_TOKEN environment variable")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None, workers=0, use_context=True)
 
 HEADERS = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
-# Map ngôn ngữ phát hiện sang model Huggingface tương ứng
 MODEL_MAP = {
     "en": "Helsinki-NLP/opus-mt-en-jap",
     "vi": "Helsinki-NLP/opus-mt-vi-jap"
@@ -28,8 +26,7 @@ def translate(text):
     try:
         lang = detect(text)
     except:
-        lang = "en"  # Mặc định nếu detect lỗi
-
+        lang = "en"
     model_id = MODEL_MAP.get(lang, "Helsinki-NLP/opus-mt-en-jap")
     api_url = f"https://api-inference.huggingface.co/models/{model_id}"
 
@@ -45,24 +42,29 @@ def translate(text):
     else:
         return f"❌ Lỗi API dịch: {response.status_code}"
 
-def start(update, context):
-    update.message.reply_text(
+# Handlers dùng async theo phiên bản mới
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
         "Chào bạn! Gửi câu tiếng Việt hoặc tiếng Anh, tôi sẽ dịch sang tiếng Nhật."
     )
 
-def handle_message(update, context):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     translated = translate(text)
-    update.message.reply_text(translated)
+    await update.message.reply_text(translated)
 
-# Đăng ký handler
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+# Khởi tạo Application
+application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
 
 @app.route("/webhook_telegram", methods=["POST"])
 def webhook():
+    from telegram import Update
     update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
+    application.process_update(update)
     return jsonify({"ok": True})
 
 @app.route("/health", methods=["GET"])
