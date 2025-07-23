@@ -1,113 +1,126 @@
 import os
-import requests
-from flask import Flask, request, jsonify
+import logging
+import asyncio
+
+from flask import Flask, request
+
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from langdetect import detect
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-# === Config ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+from langdetect import detect, LangDetectException
+from transformers import MarianMTModel, MarianTokenizer
 
-# === Flask App ===
+# --- Cấu hình logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Biến môi trường ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    logger.error("Bạn phải thiết lập biến môi trường TELEGRAM_TOKEN")
+    exit(1)
+
+PORT = int(os.getenv("PORT", "8443"))
+
+# --- Khởi tạo Flask app ---
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
 
-# === Telegram Handlers ===
-application = Application.builder().token(TELEGRAM_TOKEN).build()
+# --- Khởi tạo Bot và Application ---
+bot = Bot(token=TOKEN)
+application = Application.builder().token(TOKEN).build()
 
+# --- Load model dịch ---
+logger.info("Đang tải model dịch, vui lòng đợi...")
+# Model dịch tiếng Anh sang Tiếng Việt (ví dụ)
+model_name_en_vi = "Helsinki-NLP/opus-mt-en-vi"
+tokenizer_en_vi = MarianTokenizer.from_pretrained(model_name_en_vi)
+model_en_vi = MarianMTModel.from_pretrained(model_name_en_vi)
+logger.info("Đã tải model dịch.")
 
-# === Translation Logic ===
-def translate_text(text, src, tgt):
-    model_id = f"opus-mt-{src}-{tgt}"
-    model_url = f"https://api-inference.huggingface.co/models/Helsinki-NLP/{model_id}"
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {"inputs": text}
-
+def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
     try:
-        print(f"[Translation] Requesting model: {model_id}")
-        print(f"[Translation] Text: {text}")
-
-        response = requests.post(model_url, headers=headers, json=payload, timeout=15)
-        print(f"[Translation] Status Code: {response.status_code}")
-        print(f"[Translation] Response: {response.text}")
-
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list) and "translation_text" in data[0]:
-                return data[0]["translation_text"]
-            else:
-                print("[Translation] Unexpected response structure.")
-        elif response.status_code == 503:
-            return "⏳ Mô hình đang khởi động, vui lòng thử lại sau vài giây."
+        if src_lang == 'en' and tgt_lang == 'vi':
+            tokenizer = tokenizer_en_vi
+            model = model_en_vi
         else:
-            print("[Translation] API Error:", response.text)
-    except Exception as e:
-        print("[Translation] Exception:", str(e))
-
-    return "⚠️ Lỗi khi dịch văn bản."
-
-
-# === Telegram Bot Handlers ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Xin chào! Gửi tôi một đoạn tiếng Anh hoặc tiếng Việt để tôi dịch cho bạn.")
-
-
-async def translate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    try:
-        detected_lang = detect(user_text)
-        print(f"[Detect] Text: {user_text} | Detected: {detected_lang}")
-
-        if detected_lang.startswith('en'):
-            src, tgt = "en", "vi"
-        elif detected_lang.startswith('vi'):
-            src, tgt = "vi", "en"
-        else:
-            await update.message.reply_text("⚠️ Không nhận diện được ngôn ngữ hoặc không hỗ trợ.")
-            return
-
-        translated = translate_text(user_text, src, tgt)
-        await update.message.reply_text(f"🔁 Dịch ({src} → {tgt}):\n{translated}")
+            return f"Hiện tại bot chưa hỗ trợ dịch từ {src_lang} sang {tgt_lang}."
+        
+        inputs = tokenizer(text, return_tensors="pt", padding=True)
+        translated = model.generate(**inputs)
+        tgt_text = tokenizer.decode(translated[0], skip_special_tokens=True)
+        return tgt_text
 
     except Exception as e:
-        print("[Translate Message] Error:", e)
-        await update.message.reply_text("⚠️ Lỗi khi xử lý văn bản.")
+        logger.error(f"Lỗi khi dịch: {e}")
+        return "Lỗi khi dịch văn bản."
 
+# --- Handlers ---
 
-# === Register Telegram Handlers ===
+async def start(update: Update, context):
+    logger.info(f"User {update.effective_user.id} gọi /start")
+    await update.message.reply_text(
+        "Chào bạn! Gửi cho tôi một đoạn văn bản tiếng Anh hoặc tiếng Việt, tôi sẽ giúp bạn dịch sang ngôn ngữ còn lại."
+    )
+
+async def translate(update: Update, context):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+    logger.info(f"Nhận tin nhắn từ user {user_id}: {text}")
+
+    if not text:
+        await update.message.reply_text("Vui lòng gửi văn bản hợp lệ để dịch.")
+        return
+
+    # Phát hiện ngôn ngữ
+    try:
+        lang = detect(text)
+        logger.info(f"Phát hiện ngôn ngữ: {lang}")
+    except LangDetectException:
+        logger.warning("Không thể phát hiện ngôn ngữ.")
+        await update.message.reply_text("Xin lỗi, tôi không nhận diện được ngôn ngữ của bạn.")
+        return
+
+    # Xác định dịch sang ngôn ngữ nào
+    if lang.startswith("en"):
+        tgt_lang = "vi"
+    elif lang.startswith("vi"):
+        tgt_lang = "en"
+    else:
+        await update.message.reply_text("Hiện tại chỉ hỗ trợ dịch giữa tiếng Anh và tiếng Việt.")
+        return
+
+    # Dịch
+    result = translate_text(text, src_lang=lang[:2], tgt_lang=tgt_lang)
+    await update.message.reply_text(result)
+
+# --- Đăng ký handler ---
 application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_message))
+application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate))
 
+# --- Flask route webhook ---
 
-# === Flask Routes ===
+@app.route("/webhook_telegram", methods=["POST"])
+def webhook():
+    try:
+        update = Update.de_json(request.get_json(force=True), bot)
+        # Chạy xử lý update async trong context sync của Flask
+        asyncio.run(application.process_update(update))
+    except Exception as e:
+        logger.error(f"[Webhook Error] {e}")
+    return "ok"
+
 @app.route("/")
-def home():
-    return "🤖 Telegram Translation Bot is up."
+def index():
+    return "Bot is running."
 
 @app.route("/health")
 def health():
-    return jsonify(status="ok")
+    return "OK"
 
-@app.route("/webhook_telegram", methods=["POST"])
-def webhook_telegram():
-    try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        print("[Webhook] Incoming update:", update)
-        application.create_task(application.process_update(update))
-    except Exception as e:
-        print("[Webhook Error]", str(e))
-    return "OK", 200
-
-
-# === Main Runner ===
+# --- Chạy Flask app ---
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-
-    PORT = int(os.environ.get("PORT", 10000))
-    print(f"Starting Flask app on port {PORT}...")
+    logger.info(f"Starting app on port {PORT}")
     app.run(host="0.0.0.0", port=PORT)
