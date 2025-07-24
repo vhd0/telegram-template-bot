@@ -2,7 +2,7 @@ import requests
 import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-# from http.client import HTTPException # This import is not strictly necessary for this error, but keep it if you need it elsewhere
+from flask import Flask, request
 
 # Hàm gọi LibreTranslate API
 def libre_translate(text, source='auto', target='ja'):
@@ -64,32 +64,29 @@ async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply_text)
 
-# --- NEW: Health check handler ---
-async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responds to Render's health check at the root URL."""
-    # This handler is only for HTTP GET requests to the root path
-    # It doesn't use update.message because it's not a Telegram message.
-    # The webhook server will automatically return a 200 OK for this path.
-    # We just need to define a handler for the path '/'
-    print("Health check received!")
-    # The python-telegram-bot library's webhook server automatically handles
-    # the HTTP response for paths registered. We just need to ensure a handler exists.
-    # For a simple health check, it might not directly interact with update.message
-    # but rather ensures the server is running and responds.
-    pass # No explicit action needed for this type of health check within the bot logic
+# --- Khởi tạo Flask App ---
+flask_app = Flask(__name__)
 
+# Endpoint cho Render Health Check
+@flask_app.route('/')
+def index():
+    return "Bot is running!", 200
 
-# Main execution block for webhook deployment
+# Endpoint cụ thể cho Health Check của Render nếu nó truy cập /health
+@flask_app.route('/health')
+def health_check():
+    return "OK", 200
+
+# Main execution block
 if __name__ == "__main__":
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         print("Lỗi: Vui lòng đặt biến môi trường TELEGRAM_BOT_TOKEN")
         exit(1)
 
-    # Render provides PORT environment variable
-    PORT = int(os.environ.get("PORT", "10000")) 
+    # Render tự động cung cấp biến môi trường PORT
+    PORT = int(os.environ.get("PORT", "8080")) 
     
-    # You'll set this in Render as an environment variable
     WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
     if not WEBHOOK_URL:
         print("Lỗi: Vui lòng đặt biến môi trường WEBHOOK_URL")
@@ -100,69 +97,33 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate))
+
+    # --- Cấu hình Webhook cho Telegram Bot ---
+    # Python-Telegram-Bot sẽ xử lý các update từ Flask webhook
     
-    # --- NEW: Add the health check route ---
-    # The Telegram bot library's webhook server will handle requests to '/'
-    # You don't usually add a MessageHandler for this, but rather configure the webhook server
-    # to respond to a specific path for health checks.
-    # With python-telegram-bot, the simplest way is to ensure the server starts
-    # and handles its internal routes. If Render specifically hits '/', you might need
-    # to adjust how run_webhook handles paths or use a more advanced web framework (like Flask/FastAPI)
-    # alongside PTB if this isn't enough.
+    # URL mà Telegram sẽ gửi updates đến
+    telegram_webhook_path = f'/{TOKEN}'
+    telegram_webhook_url_full = f'{WEBHOOK_URL}{telegram_webhook_path}'
 
-    # However, PTB's run_webhook by default only routes to the TOKEN path.
-    # For a health check on '/', you'd typically need to integrate with a small web server.
-    # Let's try to explicitly add a dummy handler for the root path using a custom handler.
-    # This might require a slightly different approach with PTB's webhook server.
+    # Thiết lập webhook với Telegram
+    print("Thiết lập webhook với Telegram...")
+    try:
+        app.bot.set_webhook(url=telegram_webhook_url_full)
+        print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
+    except Exception as e:
+        print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
+        # Dù có lỗi, vẫn cố gắng chạy server để Render không bị timeout
+        pass
 
-    # A more robust solution for health checks on Render would be to serve
-    # a simple HTTP response on the root path *before* starting the PTB webhook.
-    # This often involves using a micro-framework like Flask.
-
-    # Let's adjust the `run_webhook` slightly or add a Flask app if needed.
-    # For now, let's just make sure the `print` statement for the bot running
-    # is the last thing, to confirm it starts.
-    
-    print("Thiết lập webhook...")
-    # Use run_webhook for deployment on platforms like Render
-    # The url_path for the Telegram updates is TOKEN. Render's health check hits '/'.
-    # PTB's run_webhook expects all requests to come to url_path.
-    # This is the core conflict.
-    
-    # To fix this, you often need a simple HTTP server (like Flask)
-    # that wraps your PTB app.
-
-    # Let's try a simple Flask integration.
-    # First, add `Flask` to your requirements.txt:
-    # python-telegram-bot[webhooks]==20.X
-    # requests
-    # Flask
-
-    from flask import Flask, request
-
-    # Initialize Flask app
-    flask_app = Flask(__name__)
-
-    @flask_app.route('/')
-    def index():
-        return "Bot is running!", 200
-
-    @flask_app.route(f'/{TOKEN}', methods=['POST'])
-    def telegram_webhook():
-        # This is where Telegram sends updates
-        update = Update.de_json(request.get_json(force=True), app.bot)
-        app.process_update(update)
-        return "ok", 200
+    # Flask route để nhận updates từ Telegram
+    @flask_app.route(telegram_webhook_path, methods=['POST'])
+    def telegram_update_handler():
+        if request.json:
+            update = Update.de_json(request.get_json(force=True), app.bot)
+            app.process_update(update)
+            return "ok", 200
+        return "Invalid request", 400
 
     print("Bot đang chạy...")
-    # Run the Flask app
+    # Chạy Flask app, lắng nghe trên tất cả các địa chỉ IP trên cổng được Render cấp
     flask_app.run(host="0.0.0.0", port=PORT)
-
-    # Remove the app.run_webhook() line as Flask is now handling the server.
-    # app.run_webhook(
-    #     listen="0.0.0.0",
-    #     port=PORT,
-    #     url_path=TOKEN,
-    #     webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
-    # )
-    print(f"Bot đang chạy trên cổng {PORT} với webhook_url: {WEBHOOK_URL}/{TOKEN}")
