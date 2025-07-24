@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,7 +12,6 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from contextlib import asynccontextmanager
 
 # Cấu hình logging
 logging.basicConfig(
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 # Biến global cho application
-application = None
+application: Application = None
 
 # Hàm gọi LibreTranslate API với retry logic
 async def libre_translate(text: str, source: str = 'auto', target: str = 'ja', max_retries: int = 3) -> str:
@@ -116,12 +115,10 @@ async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.error(f"Error while translating for user {user.id}: {str(e)}")
         await update.message.reply_text("⚠️ Có lỗi xảy ra. Vui lòng thử lại sau.")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan manager for FastAPI application."""
+async def setup_application() -> Application:
+    """Setup and initialize the application."""
     global application
     
-    # Lấy environment variables
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     WEBHOOK_URL = os.getenv("WEBHOOK_URL")
     
@@ -129,7 +126,6 @@ async def lifespan(app: FastAPI):
         raise ValueError("Missing required environment variables")
 
     try:
-        # Khởi tạo application
         application = (
             ApplicationBuilder()
             .token(TOKEN)
@@ -146,16 +142,30 @@ async def lifespan(app: FastAPI):
         await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
         logger.info(f"Webhook set up at {WEBHOOK_URL}/{TOKEN}")
         
-        yield
-        
+        return application
     except Exception as e:
-        logger.error(f"Error during startup: {str(e)}")
+        logger.error(f"Error during application setup: {str(e)}")
         raise
-    finally:
-        # Cleanup
-        if application:
-            await application.shutdown()
-            logger.info("Application shutdown complete")
+
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the application on startup."""
+    try:
+        await setup_application()
+        logger.info("Application successfully initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize application: {str(e)}")
+        raise
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown."""
+    global application
+    if application:
+        await application.shutdown()
+        logger.info("Application shutdown complete")
 
 # FastAPI routes
 @app.get("/")
@@ -175,18 +185,22 @@ async def telegram_webhook(token: str, request: Request):
     
     if token != os.getenv("TELEGRAM_BOT_TOKEN"):
         logger.warning(f"Invalid token received: {token[:10]}...")
-        return {"status": "error", "message": "Invalid token"}
+        raise HTTPException(status_code=403, detail="Invalid token")
+    
+    if not application:
+        logger.error("Application not initialized")
+        raise HTTPException(status_code=500, detail="Application not initialized")
     
     try:
-        update = Update.de_json(await request.json(), application.bot)
+        update_data = await request.json()
+        update = Update.de_json(update_data, application.bot)
         await application.process_update(update)
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Error processing update: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Chạy với uvicorn khi chạy trực tiếp
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(
