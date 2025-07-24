@@ -32,7 +32,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 
 # Emoji map
 EMOJI = {
@@ -89,26 +89,29 @@ class TranslationService:
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
+        self.base_url = "https://api.mymemory.translated.net/get"
 
     async def ensure_session(self):
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
 
     def preprocess_text(self, text: str) -> str:
-        """Chỉ chuẩn hóa khoảng trắng và dấu câu."""
-        text = ' '.join(text.split())
-        text = re.sub(r'\s+([.,!?])', r'\1', text)
-        return text
+        """Chuẩn hóa text."""
+        return text.strip()
 
     def postprocess_translation(self, translated: str) -> str:
-        """Chỉ đảm bảo kết thúc câu đúng cách."""
+        """Chuẩn hóa bản dịch."""
         if not translated:
             return translated
-
-        if not translated.endswith('。'):
-            translated += '。'
-
-        return translated
+            
+        # Xử lý HTML entities
+        translated = translated.replace("&quot;", '"')
+        translated = translated.replace("&#39;", "'")
+        translated = translated.replace("&amp;", "&")
+        translated = translated.replace("&lt;", "<")
+        translated = translated.replace("&gt;", ">")
+        
+        return translated.strip()
 
     def maybe_cleanup_cache(self):
         if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
@@ -116,6 +119,7 @@ class TranslationService:
             self.last_cleanup = datetime.utcnow()
 
     async def translate(self, text: str) -> TranslationResult:
+        """Dịch văn bản sử dụng MyMemory API."""
         self.maybe_cleanup_cache()
         
         # Check cache
@@ -131,56 +135,47 @@ class TranslationService:
         # Prepare translation
         await self.ensure_session()
         processed_text = self.preprocess_text(text)
-        encoded_text = urllib.parse.quote(processed_text)
-        
         result = TranslationResult(original_text=text)
         
-        url = (
-            "https://translate.googleapis.com/translate_a/single"
-            "?client=gtx&sl=auto&tl=ja&dt=t"
-            f"&q={encoded_text}"
-        )
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json'
+        params = {
+            "q": processed_text,
+            "langpair": "vi|ja",
+            "de": "a@b.c"  # Email for better rate limits
         }
 
         # Try translation with retries
         for attempt in range(RETRY_COUNT):
             try:
                 async with self.session.get(
-                    url,
-                    headers=headers,
+                    self.base_url,
+                    params=params,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     if response.status == 200:
                         data = await response.json()
                         
-                        if not data or not isinstance(data, list):
+                        if not data or "responseData" not in data:
                             raise ValueError("Invalid response format")
                         
-                        translations = data[0] if data else []
-                        if not translations:
-                            raise ValueError("No translation data")
-                        
-                        translated_text = ''
-                        for item in translations:
-                            if (isinstance(item, list) and 
-                                len(item) > 0 and 
-                                isinstance(item[0], str)):
-                                translated_text += item[0]
-                        
+                        translated_text = data["responseData"].get("translatedText")
                         if not translated_text:
                             raise ValueError("Empty translation")
                         
+                        # Process the translation
                         result.translated_text = self.postprocess_translation(translated_text)
                         result.success = True
                         
                         # Cache successful translation
                         self.cache.set(text, result.translated_text)
                         
+                        logger.info(
+                            f"Translation successful: {text[:30]} -> "
+                            f"{result.translated_text[:30]}"
+                        )
+                        
                         return result
+                    else:
+                        raise ValueError(f"API returned status {response.status}")
                         
             except Exception as e:
                 logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
