@@ -1,6 +1,8 @@
 import requests
+import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from http.client import HTTPException # Import HTTPException for proper error handling
 
 # Hàm gọi LibreTranslate API
 def libre_translate(text, source='auto', target='ja'):
@@ -13,11 +15,14 @@ def libre_translate(text, source='auto', target='ja'):
     }
     try:
         response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
+        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
         result = response.json()
         return result.get('translatedText')
-    except Exception as e:
-        print("[LibreTranslate API error]:", e)
+    except requests.exceptions.RequestException as e: # Catch all requests-related errors
+        print(f"[LibreTranslate API error]: {e}")
+        return None
+    except Exception as e: # Catch any other unexpected errors
+        print(f"[General error in libre_translate]: {e}")
         return None
 
 # Xử lý lệnh /start
@@ -59,12 +64,20 @@ async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply_text)
 
+# Main execution block for webhook deployment
 if __name__ == "__main__":
-    import os
-
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         print("Lỗi: Vui lòng đặt biến môi trường TELEGRAM_BOT_TOKEN")
+        exit(1)
+
+    # Render provides PORT environment variable
+    PORT = int(os.environ.get("PORT", "8080")) 
+    
+    # You'll set this in Render as an environment variable
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
+    if not WEBHOOK_URL:
+        print("Lỗi: Vui lòng đặt biến môi trường WEBHOOK_URL")
         exit(1)
 
     app = ApplicationBuilder().token(TOKEN).build()
@@ -73,5 +86,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate))
 
-    print("Bot đang chạy...")
-    app.run_polling()
+    print("Thiết lập webhook...")
+    # Use run_webhook for deployment on platforms like Render
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN, # Use the token as the url_path for security
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
+    )
+    print(f"Bot đang chạy trên cổng {PORT} với webhook_url: {WEBHOOK_URL}/{TOKEN}")
