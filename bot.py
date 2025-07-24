@@ -3,6 +3,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, request
+import asyncio # Thêm import asyncio
 
 # Hàm gọi LibreTranslate API
 def libre_translate(text, source='auto', target='ja'):
@@ -55,6 +56,7 @@ async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Thông báo đang dịch
     await update.message.chat.send_action(action="typing")
 
+    # Hàm libre_translate là đồng bộ, nên không cần await
     translated = libre_translate(text, source='auto', target='ja')
 
     if translated:
@@ -112,15 +114,15 @@ if __name__ == "__main__":
         print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
     except Exception as e:
         print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
-        # Dù có lỗi, vẫn cố gắng chạy server để Render không bị timeout
-        pass
+        pass # Vẫn cố gắng chạy server dù có lỗi webhook
 
     # Flask route để nhận updates từ Telegram
     @flask_app.route(telegram_webhook_path, methods=['POST'])
-    def telegram_update_handler():
+    async def telegram_update_handler(): # Thêm 'async' vào đây
         if request.json:
             update = Update.de_json(request.get_json(force=True), app.bot)
-            app.process_update(update)
+            # await the coroutine
+            await app.process_update(update) # Thêm 'await' vào đây
             return "ok", 200
         return "Invalid request", 400
 
