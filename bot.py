@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-import requests
+import json
+import aiohttp
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
@@ -23,32 +24,71 @@ logger = logging.getLogger(__name__)
 # Khởi tạo FastAPI app
 app = FastAPI()
 
-# Biến global cho application
+# Biến global cho application và session
 application: Application = None
+http_session: aiohttp.ClientSession = None
 
-# Hàm gọi LibreTranslate API với retry logic
-async def libre_translate(text: str, source: str = 'auto', target: str = 'ja', max_retries: int = 3) -> str:
-    url = "https://libretranslate.de/translate"
-    payload = {
-        "q": text,
-        "source": source,
-        "target": target,
-        "format": "text"
+# Các API translate dự phòng
+TRANSLATION_APIS = [
+    {
+        "url": "https://libretranslate.de/translate",
+        "payload": lambda text: {
+            "q": text,
+            "source": "auto",
+            "target": "ja",
+            "format": "text"
+        }
+    },
+    {
+        "url": "https://translate.argosopentech.com/translate",
+        "payload": lambda text: {
+            "q": text,
+            "source": "auto",
+            "target": "ja",
+            "format": "text"
+        }
     }
+]
+
+async def try_translate_with_api(session: aiohttp.ClientSession, text: str, api_config: dict) -> str:
+    """Try to translate text using a specific API."""
+    try:
+        async with session.post(
+            api_config["url"],
+            json=api_config["payload"](text),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as response:
+            if response.status == 200:
+                data = await response.json()
+                if "translatedText" in data:
+                    return data["translatedText"]
+            logger.warning(f"API {api_config['url']} returned status {response.status}")
+            return None
+    except Exception as e:
+        logger.error(f"Error with API {api_config['url']}: {str(e)}")
+        return None
+
+async def translate_text_with_fallback(text: str, max_retries: int = 2) -> str:
+    """Attempt to translate text using multiple APIs with retry logic."""
+    global http_session
     
+    if not http_session or http_session.closed:
+        http_session = aiohttp.ClientSession()
+
     for attempt in range(max_retries):
-        try:
-            async with asyncio.timeout(10):  # 10 seconds timeout
-                response = requests.post(url, json=payload)
-                response.raise_for_status()
-                result = response.json()
-                return result.get('translatedText', '')
-        except Exception as e:
-            logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
-            if attempt == max_retries - 1:  # Last attempt
-                logger.error(f"All translation attempts failed for text: {text}")
-                return None
-            await asyncio.sleep(1)  # Wait 1 second before retrying
+        for api_config in TRANSLATION_APIS:
+            try:
+                result = await try_translate_with_api(http_session, text, api_config)
+                if result:
+                    return result
+            except Exception as e:
+                logger.error(f"Translation attempt {attempt + 1} failed for API {api_config['url']}: {str(e)}")
+                continue
+        
+        if attempt < max_retries - 1:
+            await asyncio.sleep(1)
+    
+    return None
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -95,7 +135,7 @@ async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.chat.send_action("typing")
         
         # Thực hiện dịch
-        translated = await libre_translate(text)
+        translated = await translate_text_with_fallback(text)
         
         if translated:
             response_text = (
@@ -162,10 +202,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
-    global application
+    global application, http_session
     if application:
         await application.shutdown()
         logger.info("Application shutdown complete")
+    
+    if http_session and not http_session.closed:
+        await http_session.close()
+        logger.info("HTTP session closed")
 
 # FastAPI routes
 @app.get("/")
