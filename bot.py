@@ -32,7 +32,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # Emoji map
 EMOJI = {
@@ -55,8 +55,6 @@ class CacheEntry:
 class TranslationResult:
     original_text: str
     translated_text: Optional[str] = None
-    source_lang: str = 'auto'
-    target_lang: str = 'ja'
     success: bool = False
     error_message: Optional[str] = None
     from_cache: bool = False
@@ -90,11 +88,6 @@ class TranslationService:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
-        self.keigo_patterns = {
-            r'\b(xin|làm ơn|vui lòng)\b': 'お願いします',
-            r'\b(cảm ơn)\b': 'ありがとうございます',
-            r'\b(xin lỗi)\b': '申し訳ございません'
-        }
         self.last_cleanup = datetime.utcnow()
 
     async def ensure_session(self):
@@ -102,21 +95,18 @@ class TranslationService:
             self.session = aiohttp.ClientSession()
 
     def preprocess_text(self, text: str) -> str:
+        """Chỉ chuẩn hóa khoảng trắng và dấu câu."""
         text = ' '.join(text.split())
         text = re.sub(r'\s+([.,!?])', r'\1', text)
-        
-        for pattern, replacement in self.keigo_patterns.items():
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-        
         return text
 
     def postprocess_translation(self, translated: str) -> str:
+        """Chỉ đảm bảo kết thúc câu đúng cách."""
         if not translated:
             return translated
 
-        polite_endings = ['ます', 'です', 'ございます', 'でしょうか']
-        if not any(translated.endswith(end) for end in polite_endings):
-            translated = f"{translated.rstrip('。')}です。"
+        if not translated.endswith('。'):
+            translated += '。'
 
         return translated
 
@@ -253,14 +243,13 @@ class TelegramBot:
         help_text = (
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
             "1. Gửi văn bản tiếng Việt\n"
-            "2. Bot sẽ tự động điều chỉnh kính ngữ\n"
+            "2. Bot sẽ dịch sang tiếng Nhật\n"
             "3. Bản dịch sẽ được gửi riêng để dễ copy\n"
             "4. /start - Bắt đầu sử dụng\n"
             "5. /help - Xem hướng dẫn\n\n"
             f"{EMOJI['help']} Mẹo:\n"
             "• Viết câu đầy đủ và rõ ràng\n"
-            f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự\n"
-            "• Dùng từ ngữ lịch sự"
+            f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự"
         )
         await update.message.reply_text(help_text)
 
@@ -352,7 +341,7 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI
 app = FastAPI(
     title="Telegram Translation Bot",
-    description="Bot dịch văn bản Việt-Nhật với kính ngữ tự động",
+    description="Bot dịch văn bản Việt-Nhật",
     version=VERSION,
     lifespan=lifespan
 )
