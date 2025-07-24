@@ -3,7 +3,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, request
-import asyncio # Thêm import asyncio
+import asyncio # Đảm bảo đã import asyncio
 
 # Hàm gọi LibreTranslate API
 def libre_translate(text, source='auto', target='ja'):
@@ -107,22 +107,26 @@ if __name__ == "__main__":
     telegram_webhook_path = f'/{TOKEN}'
     telegram_webhook_url_full = f'{WEBHOOK_URL}{telegram_webhook_path}'
 
-    # Thiết lập webhook với Telegram
-    print("Thiết lập webhook với Telegram...")
-    try:
-        app.bot.set_webhook(url=telegram_webhook_url_full)
-        print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
-    except Exception as e:
-        print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
-        pass # Vẫn cố gắng chạy server dù có lỗi webhook
+    # Hàm async để thiết lập webhook
+    async def setup_webhook():
+        print("Thiết lập webhook với Telegram...")
+        try:
+            # AWAIT the set_webhook call
+            await app.bot.set_webhook(url=telegram_webhook_url_full)
+            print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
+        except Exception as e:
+            print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
+            pass # Vẫn cố gắng chạy server dù có lỗi webhook
+
+    # Chạy hàm async để thiết lập webhook
+    asyncio.run(setup_webhook())
 
     # Flask route để nhận updates từ Telegram
     @flask_app.route(telegram_webhook_path, methods=['POST'])
-    async def telegram_update_handler(): # Thêm 'async' vào đây
+    async def telegram_update_handler():
         if request.json:
             update = Update.de_json(request.get_json(force=True), app.bot)
-            # await the coroutine
-            await app.process_update(update) # Thêm 'await' vào đây
+            await app.process_update(update)
             return "ok", 200
         return "Invalid request", 400
 
