@@ -3,7 +3,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from flask import Flask, request
-import asyncio # Đảm bảo đã import asyncio
+import asyncio
 
 # Hàm gọi LibreTranslate API
 def libre_translate(text, source='auto', target='ja'):
@@ -28,6 +28,7 @@ def libre_translate(text, source='auto', target='ja'):
 
 # Xử lý lệnh /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Received /start command from {update.effective_user.id}")
     welcome_text = (
         "Xin chào!\n"
         "Bot này sẽ dịch văn bản bạn gửi sang tiếng Nhật.\n"
@@ -38,6 +39,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Xử lý lệnh /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Received /help command from {update.effective_user.id}")
     help_text = (
         "Hướng dẫn sử dụng:\n"
         "- Gửi bất kỳ văn bản nào, bot sẽ dịch sang tiếng Nhật.\n"
@@ -48,6 +50,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Xử lý tin nhắn văn bản để dịch
 async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Received text message from {update.effective_user.id}: '{update.message.text}'")
     text = update.message.text.strip()
     if not text:
         await update.message.reply_text("Vui lòng nhập văn bản để dịch.")
@@ -56,13 +59,14 @@ async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Thông báo đang dịch
     await update.message.chat.send_action(action="typing")
 
-    # Hàm libre_translate là đồng bộ, nên không cần await
     translated = libre_translate(text, source='auto', target='ja')
 
     if translated:
         reply_text = f"{translated}"
+        print(f"Translated '{text}' to '{translated}'")
     else:
         reply_text = "⚠️ Có lỗi xảy ra khi dịch văn bản, vui lòng thử lại sau."
+        print(f"Translation failed for '{text}'")
 
     await update.message.reply_text(reply_text)
 
@@ -86,7 +90,6 @@ if __name__ == "__main__":
         print("Lỗi: Vui lòng đặt biến môi trường TELEGRAM_BOT_TOKEN")
         exit(1)
 
-    # Render tự động cung cấp biến môi trường PORT
     PORT = int(os.environ.get("PORT", "8080")) 
     
     WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
@@ -96,40 +99,49 @@ if __name__ == "__main__":
 
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Thêm các handler VÀO ĐÂY (trước khi initialize)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate))
 
     # --- Cấu hình Webhook cho Telegram Bot ---
-    # Python-Telegram-Bot sẽ xử lý các update từ Flask webhook
-    
-    # URL mà Telegram sẽ gửi updates đến
     telegram_webhook_path = f'/{TOKEN}'
     telegram_webhook_url_full = f'{WEBHOOK_URL}{telegram_webhook_path}'
 
-    # Hàm async để thiết lập webhook
-    async def setup_webhook():
+    async def setup_webhook_and_initialize(): # Đổi tên hàm để rõ ràng hơn
+        # KHỞI TẠO APPLICATION TRƯỚC KHI XỬ LÝ BẤT KỲ UPDATE NÀO
+        print("Initializing Telegram Application...")
+        await app.initialize() # <--- DÒNG MỚI QUAN TRỌNG NHẤT
+
         print("Thiết lập webhook với Telegram...")
         try:
-            # AWAIT the set_webhook call
             await app.bot.set_webhook(url=telegram_webhook_url_full)
             print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
         except Exception as e:
             print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
-            pass # Vẫn cố gắng chạy server dù có lỗi webhook
+            pass
 
-    # Chạy hàm async để thiết lập webhook
-    asyncio.run(setup_webhook())
+    # Chạy hàm async để thiết lập webhook và khởi tạo
+    asyncio.run(setup_webhook_and_initialize())
 
     # Flask route để nhận updates từ Telegram
     @flask_app.route(telegram_webhook_path, methods=['POST'])
     async def telegram_update_handler():
+        print("Received POST request on Telegram webhook endpoint.")
         if request.json:
-            update = Update.de_json(request.get_json(force=True), app.bot)
-            await app.process_update(update)
-            return "ok", 200
-        return "Invalid request", 400
+            print(f"Request JSON: {request.json}")
+            try:
+                update = Update.de_json(request.get_json(force=True), app.bot)
+                print(f"Successfully parsed Telegram update: {update.update_id}")
+                await app.process_update(update)
+                print("Finished processing Telegram update.")
+                return "ok", 200
+            except Exception as e:
+                print(f"Error processing Telegram update: {e}")
+                return "Error processing update", 500
+        else:
+            print("Received POST request with no JSON data or invalid JSON.")
+            return "Invalid request", 400
 
-    print("Bot đang chạy...")
-    # Chạy Flask app, lắng nghe trên tất cả các địa chỉ IP trên cổng được Render cấp
+    print("Bot đang chạy và sẵn sàng nhận updates...")
     flask_app.run(host="0.0.0.0", port=PORT)
