@@ -5,8 +5,8 @@ import json
 import aiohttp
 import urllib.parse
 import re
-from datetime import datetime
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
-VERSION = "1.0.0"
+CACHE_TIMEOUT = 3600  # 1 hour
+VERSION = "1.0.1"
 
 # Emoji Constants
 EMOJI = {
@@ -44,8 +45,15 @@ EMOJI = {
     'success': '✅',
     'loading': '⏳',
     'help': '💡',
+    'cache': '💾',
 }
 
+@dataclass
+class CacheEntry:
+    """Data class cho cache entry."""
+    text: str
+    timestamp: datetime
+    
 @dataclass
 class TranslationResult:
     """Data class cho kết quả dịch."""
@@ -55,40 +63,91 @@ class TranslationResult:
     target_lang: str = 'ja'
     success: bool = False
     error_message: Optional[str] = None
+    from_cache: bool = False
     timestamp: str = datetime.utcnow().isoformat()
+
+class TranslationCache:
+    """Class quản lý cache cho các bản dịch."""
+    
+    def __init__(self, timeout: int = CACHE_TIMEOUT):
+        self.cache: Dict[str, CacheEntry] = {}
+        self.timeout = timeout
+    
+    def get(self, key: str) -> Optional[str]:
+        """Lấy bản dịch từ cache."""
+        if key in self.cache:
+            entry = self.cache[key]
+            if datetime.utcnow() - entry.timestamp < timedelta(seconds=self.timeout):
+                return entry.text
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, key: str, value: str):
+        """Lưu bản dịch vào cache."""
+        self.cache[key] = CacheEntry(
+            text=value,
+            timestamp=datetime.utcnow()
+        )
+    
+    def cleanup(self):
+        """Xóa các entries hết hạn."""
+        current_time = datetime.utcnow()
+        expired_keys = [
+            key for key, entry in self.cache.items()
+            if current_time - entry.timestamp >= timedelta(seconds=self.timeout)
+        ]
+        for key in expired_keys:
+            del self.cache[key]
 
 class TranslationService:
     """Service class xử lý dịch thuật."""
     
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
+        self.cache = TranslationCache()
+        self._setup_keigo_patterns()
+        self.requests_count = 0
+        self.last_cleanup = datetime.utcnow()
+
+    def _setup_keigo_patterns(self):
+        """Thiết lập patterns cho kính ngữ."""
         self.keigo_patterns = {
             # Đại từ nhân xưng
             r'\b(tôi|tao|tớ|mình)\b': '私',
             r'\b(bạn|cậu|mày)\b': 'あなた',
             r'\b(anh ấy|ông ấy)\b': '彼',
             r'\b(chị ấy|bà ấy)\b': '彼女',
+            r'\b(chúng tôi|chúng ta|chúng mình)\b': '私たち',
+            r'\b(họ|bọn họ)\b': '彼ら',
             
             # Từ lịch sự
             r'\b(xin|làm ơn|vui lòng)\b': 'お願いします',
             r'\b(cảm ơn)\b': 'ありがとうございます',
             r'\b(xin lỗi)\b': '申し訳ございません',
+            r'\b(chào|xin chào)\b': 'こんにちは',
             
             # Trợ từ lịch sự
             r'\bhãy\b': 'ください',
             r'\b(có thể|được không)\b': 'よろしいでしょうか',
+            r'\b(xin phép)\b': '失礼します',
         }
 
     async def ensure_session(self):
         """Đảm bảo session được khởi tạo."""
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
+            logger.info("Created new aiohttp session")
 
     def preprocess_text(self, text: str) -> str:
         """Tiền xử lý văn bản."""
+        # Chuẩn hóa whitespace
         text = ' '.join(text.split())
+        
+        # Chuẩn hóa dấu câu
         text = re.sub(r'\s+([.,!?])', r'\1', text)
         
+        # Áp dụng kính ngữ patterns
         for pattern, replacement in self.keigo_patterns.items():
             text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
         
@@ -99,24 +158,45 @@ class TranslationService:
         if not translated:
             return translated
 
+        # Thêm trợ từ は sau chủ ngữ
         translated = re.sub(r'(私|あなた)(?!は|が)', r'\1は', translated)
         
-        polite_endings = ['ます', 'です', 'ございます']
+        # Đảm bảo kết thúc câu lịch sự
+        polite_endings = ['ます', 'です', 'ございます', 'でしょうか']
         if not any(translated.endswith(end) for end in polite_endings):
             if translated.endswith('。'):
                 translated = translated[:-1] + 'です。'
             else:
                 translated += 'です。'
         
+        # Chuẩn hóa dấu chấm
         if not translated.endswith('。'):
             translated += '。'
         
         return translated
 
+    def maybe_cleanup_cache(self):
+        """Dọn dẹp cache nếu cần."""
+        if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
+            self.cache.cleanup()
+            self.last_cleanup = datetime.utcnow()
+            logger.info("Cache cleanup performed")
+
     async def translate(self, text: str) -> TranslationResult:
-        """Dịch văn bản."""
-        await self.ensure_session()
+        """Dịch văn bản với cache."""
+        self.maybe_cleanup_cache()
         
+        # Kiểm tra cache
+        cached_translation = self.cache.get(text)
+        if cached_translation:
+            return TranslationResult(
+                original_text=text,
+                translated_text=cached_translation,
+                success=True,
+                from_cache=True
+            )
+        
+        await self.ensure_session()
         processed_text = self.preprocess_text(text)
         encoded_text = urllib.parse.quote(processed_text)
         
@@ -124,12 +204,17 @@ class TranslationService:
         
         url = (
             "https://translate.googleapis.com/translate_a/single"
-            "?client=gtx&sl=auto&tl=ja&dt=t&dt=rm&dt=bd"
+            "?client=gtx&sl=auto&tl=ja&dt=t"
             f"&q={encoded_text}"
         )
 
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            ),
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
         }
 
         for attempt in range(RETRY_COUNT):
@@ -140,20 +225,50 @@ class TranslationService:
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     if response.status == 200:
-                        data = await response.json()
-                        if data and isinstance(data, list) and len(data) > 0:
-                            translated_parts = [
-                                part[0] for part in data[0]
-                                if part and isinstance(part, list) and len(part) > 0
-                            ]
+                        try:
+                            data = await response.json()
                             
-                            if translated_parts:
-                                result.translated_text = self.postprocess_translation(
-                                    ''.join(translated_parts)
-                                )
-                                result.success = True
-                                return result
+                            if not data or not isinstance(data, list):
+                                raise ValueError("Invalid response format")
                             
+                            translations = data[0] if data else []
+                            if not translations or not isinstance(translations, list):
+                                raise ValueError("No translation data")
+                            
+                            translated_parts = []
+                            for item in translations:
+                                if (isinstance(item, list) and 
+                                    len(item) > 0 and 
+                                    isinstance(item[0], str)):
+                                    translated_parts.append(item[0])
+                            
+                            if not translated_parts:
+                                raise ValueError("Empty translation")
+                            
+                            translated_text = ''.join(translated_parts)
+                            result.translated_text = self.postprocess_translation(translated_text)
+                            result.success = True
+                            
+                            # Lưu vào cache
+                            self.cache.set(text, result.translated_text)
+                            
+                            logger.info(
+                                f"Translation successful: {text[:30]} -> {result.translated_text[:30]}"
+                            )
+                            
+                            return result
+                            
+                        except (json.JSONDecodeError, IndexError, KeyError, ValueError) as e:
+                            logger.error(f"Error processing translation response: {str(e)}")
+                            if attempt < RETRY_COUNT - 1:
+                                await asyncio.sleep(RETRY_DELAY)
+                            continue
+                    else:
+                        logger.error(f"API returned status {response.status}")
+                        if attempt < RETRY_COUNT - 1:
+                            await asyncio.sleep(RETRY_DELAY)
+                        continue
+                        
             except Exception as e:
                 logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
                 if attempt < RETRY_COUNT - 1:
@@ -161,6 +276,7 @@ class TranslationService:
                 continue
 
         result.error_message = "Không thể dịch văn bản. Vui lòng thử lại sau."
+        logger.error(f"All translation attempts failed for text: {text[:50]}")
         return result
 
 class TelegramBot:
@@ -195,6 +311,7 @@ class TelegramBot:
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
             
             self._initialized = True
+            logger.info("Bot initialized successfully")
             return True
             
         except Exception as e:
@@ -208,7 +325,7 @@ class TelegramBot:
         
         welcome_text = (
             f"{EMOJI['hello']} こんにちは {user.first_name}さん！\n\n"
-            f"{EMOJI['info']} Bot dịch văn bản Việt-Nhật\n"
+            f"{EMOJI['info']} Bot dịch văn bản Việt-Nhật với kính ngữ tự động\n"
             f"{EMOJI['translate']} Gửi tin nhắn để nhận bản dịch\n"
             f"{EMOJI['help']} Gõ /help để xem hướng dẫn chi tiết"
         )
@@ -228,7 +345,9 @@ class TelegramBot:
             "• Viết câu đầy đủ và rõ ràng\n"
             f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự\n"
             "• Dùng từ ngữ lịch sự để có kính ngữ phù hợp\n"
-            "• Tránh viết tắt và teen code"
+            "• Tránh viết tắt và teen code\n\n"
+            f"{EMOJI['cache']} Bot sẽ lưu cache các bản dịch\n"
+            "để tăng tốc độ phản hồi"
         )
         await update.message.reply_text(help_text)
 
@@ -238,7 +357,9 @@ class TelegramBot:
         text = update.message.text.strip()
         
         if not text:
-            await update.message.reply_text(f"{EMOJI['warning']} Vui lòng nhập văn bản để dịch.")
+            await update.message.reply_text(
+                f"{EMOJI['warning']} Vui lòng nhập văn bản để dịch."
+            )
             return
 
         if len(text) > MAX_TEXT_LENGTH:
@@ -256,8 +377,9 @@ class TelegramBot:
             result = await self.translator.translate(text)
             
             if result.success and result.translated_text:
+                cache_indicator = f"{EMOJI['cache']} " if result.from_cache else ""
                 response_text = (
-                    f"{EMOJI['translate']} 日本語の翻訳:\n"
+                    f"{cache_indicator}{EMOJI['translate']} 日本語の翻訳:\n"
                     f"{result.translated_text}\n\n"
                     f"{EMOJI['original']} 原文:\n"
                     f"{result.original_text}"
@@ -328,11 +450,13 @@ app = FastAPI(
 async def root():
     """Root endpoint."""
     uptime = datetime.utcnow() - bot._start_time
+    cache_size = len(bot.translator.cache.cache)
     return {
         "status": "active" if bot._initialized else "initializing",
         "timestamp": datetime.utcnow().isoformat(),
         "version": VERSION,
-        "uptime_seconds": uptime.total_seconds()
+        "uptime_seconds": uptime.total_seconds(),
+        "cache_entries": cache_size
     }
 
 @app.get("/health")
@@ -343,7 +467,8 @@ async def health_check():
     return {
         "status": "ok",
         "bot_status": "active",
-        "version": VERSION
+        "version": VERSION,
+        "cache_size": len(bot.translator.cache.cache)
     }
 
 @app.post(f"/{{token}}")
