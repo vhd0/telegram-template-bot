@@ -6,17 +6,16 @@ import aiohttp
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes
 )
@@ -32,8 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
-CACHE_TIMEOUT = 3600
-VERSION = "1.0.2"
+CACHE_TIMEOUT = 3600  # 1 hour
+VERSION = "1.0.3"
 
 # Emoji map
 EMOJI = {
@@ -44,9 +43,7 @@ EMOJI = {
     'error': '❌',
     'success': '✅',
     'help': '💡',
-    'cache': '💾',
-    'copy': '📋',
-    'arrow': '➜'
+    'cache': '💾'
 }
 
 @dataclass
@@ -177,17 +174,16 @@ class TranslationService:
                         if not translations:
                             raise ValueError("No translation data")
                         
-                        translated_parts = []
+                        translated_text = ''
                         for item in translations:
                             if (isinstance(item, list) and 
                                 len(item) > 0 and 
                                 isinstance(item[0], str)):
-                                translated_parts.append(item[0])
+                                translated_text += item[0]
                         
-                        if not translated_parts:
+                        if not translated_text:
                             raise ValueError("Empty translation")
                         
-                        translated_text = ''.join(translated_parts)
                         result.translated_text = self.postprocess_translation(translated_text)
                         result.success = True
                         
@@ -228,7 +224,6 @@ class TelegramBot:
             self.application.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self.translate_text)
             )
-            self.application.add_handler(CallbackQueryHandler(self.button_click))
             
             await self.application.initialize()
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
@@ -259,7 +254,7 @@ class TelegramBot:
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
             "1. Gửi văn bản tiếng Việt\n"
             "2. Bot sẽ tự động điều chỉnh kính ngữ\n"
-            "3. Nhấn nút Copy để sao chép bản dịch\n"
+            "3. Bản dịch sẽ được gửi riêng để dễ copy\n"
             "4. /start - Bắt đầu sử dụng\n"
             "5. /help - Xem hướng dẫn\n\n"
             f"{EMOJI['help']} Mẹo:\n"
@@ -268,17 +263,6 @@ class TelegramBot:
             "• Dùng từ ngữ lịch sự"
         )
         await update.message.reply_text(help_text)
-
-    async def button_click(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data.startswith("copy_"):
-            translated_text = query.data.replace("copy_", "")
-            await query.message.reply_text(
-                f"{translated_text}",
-                quote=False
-            )
 
     async def translate_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -305,27 +289,14 @@ class TelegramBot:
             result = await self.translator.translate(text)
             
             if result.success and result.translated_text:
-                # Send translation info
-                info_text = (
-                    f"{EMOJI['translate']} Bản dịch Việt-Nhật:\n"
-                    f"[{EMOJI['cache'] if result.from_cache else EMOJI['success']}] "
-                    f"{result.original_text} {EMOJI['arrow']} Xem bên dưới"
-                )
-                await update.message.reply_text(info_text)
-                
-                # Send translation for easy copying
-                keyboard = [[
-                    InlineKeyboardButton(
-                        f"{EMOJI['copy']} Copy",
-                        callback_data=f"copy_{result.translated_text}"
-                    )
-                ]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
+                # Tin nhắn thông báo ngắn gọn
                 await update.message.reply_text(
-                    result.translated_text,
-                    reply_markup=reply_markup
+                    f"{EMOJI['translate']} Bản dịch:" +
+                    (f" {EMOJI['cache']}" if result.from_cache else "")
                 )
+                
+                # Bản dịch trong tin nhắn riêng
+                await update.message.reply_text(result.translated_text)
                 
                 logger.info(f"Translation successful for user {user.id}")
             else:
