@@ -1,12 +1,34 @@
-import requests
-import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from flask import Flask, request
 import asyncio
+import logging
+import os
+import requests
+from fastapi import FastAPI, Request
+from telegram import Update
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes
+)
+from contextlib import asynccontextmanager
 
-# Hàm gọi LibreTranslate API
-def libre_translate(text, source='auto', target='ja'):
+# Cấu hình logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Khởi tạo FastAPI app
+app = FastAPI()
+
+# Biến global cho application
+application = None
+
+# Hàm gọi LibreTranslate API với retry logic
+async def libre_translate(text: str, source: str = 'auto', target: str = 'ja', max_retries: int = 3) -> str:
     url = "https://libretranslate.de/translate"
     payload = {
         "q": text,
@@ -14,134 +36,163 @@ def libre_translate(text, source='auto', target='ja'):
         "target": target,
         "format": "text"
     }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
-        result = response.json()
-        return result.get('translatedText')
-    except requests.exceptions.RequestException as e: # Catch all requests-related errors
-        print(f"[LibreTranslate API error]: {e}")
-        return None
-    except Exception as e: # Catch any other unexpected errors
-        print(f"[General error in libre_translate]: {e}")
-        return None
+    
+    for attempt in range(max_retries):
+        try:
+            async with asyncio.timeout(10):  # 10 seconds timeout
+                response = requests.post(url, json=payload)
+                response.raise_for_status()
+                result = response.json()
+                return result.get('translatedText', '')
+        except Exception as e:
+            logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
+            if attempt == max_retries - 1:  # Last attempt
+                logger.error(f"All translation attempts failed for text: {text}")
+                return None
+            await asyncio.sleep(1)  # Wait 1 second before retrying
 
-# Xử lý lệnh /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Received /start command from {update.effective_user.id}")
+# Command handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    logger.info(f"User {user.id} started the bot")
     welcome_text = (
-        "Xin chào!\n"
+        f"Xin chào {user.first_name}!\n\n"
         "Bot này sẽ dịch văn bản bạn gửi sang tiếng Nhật.\n"
         "Bạn chỉ cần gửi tin nhắn, bot sẽ trả về bản dịch.\n"
         "Gõ /help nếu cần trợ giúp."
     )
     await update.message.reply_text(welcome_text)
 
-# Xử lý lệnh /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Received /help command from {update.effective_user.id}")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    logger.info(f"User {update.effective_user.id} requested help")
     help_text = (
-        "Hướng dẫn sử dụng:\n"
-        "- Gửi bất kỳ văn bản nào, bot sẽ dịch sang tiếng Nhật.\n"
-        "- /start để xem lời chào.\n"
-        "- /help để xem lại hướng dẫn này."
+        "Hướng dẫn sử dụng:\n\n"
+        "1. Gửi bất kỳ văn bản nào, bot sẽ dịch sang tiếng Nhật\n"
+        "2. /start - Xem lời chào\n"
+        "3. /help - Xem hướng dẫn này\n\n"
+        "Lưu ý: Độ dài văn bản không quá 500 ký tự"
     )
     await update.message.reply_text(help_text)
 
-# Xử lý tin nhắn văn bản để dịch
-async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Received text message from {update.effective_user.id}: '{update.message.text}'")
+async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Translate text messages to Japanese."""
+    user = update.effective_user
     text = update.message.text.strip()
+    
     if not text:
-        await update.message.reply_text("Vui lòng nhập văn bản để dịch.")
+        await update.message.reply_text("⚠️ Vui lòng nhập văn bản để dịch.")
         return
 
-    # Thông báo đang dịch
-    await update.message.chat.send_action(action="typing")
+    if len(text) > 500:
+        await update.message.reply_text("⚠️ Văn bản quá dài. Vui lòng giữ dưới 500 ký tự.")
+        return
 
-    translated = libre_translate(text, source='auto', target='ja')
-
-    if translated:
-        reply_text = f"{translated}"
-        print(f"Translated '{text}' to '{translated}'")
-    else:
-        reply_text = "⚠️ Có lỗi xảy ra khi dịch văn bản, vui lòng thử lại sau."
-        print(f"Translation failed for '{text}'")
-
-    await update.message.reply_text(reply_text)
-
-# --- Khởi tạo Flask App ---
-flask_app = Flask(__name__)
-
-# Endpoint cho Render Health Check
-@flask_app.route('/')
-def index():
-    return "Bot is running!", 200
-
-# Endpoint cụ thể cho Health Check của Render nếu nó truy cập /health
-@flask_app.route('/health')
-def health_check():
-    return "OK", 200
-
-# Main execution block
-if __name__ == "__main__":
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        print("Lỗi: Vui lòng đặt biến môi trường TELEGRAM_BOT_TOKEN")
-        exit(1)
-
-    PORT = int(os.environ.get("PORT", "8080")) 
+    logger.info(f"Translating for user {user.id}: {text[:50]}...")
     
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
-    if not WEBHOOK_URL:
-        print("Lỗi: Vui lòng đặt biến môi trường WEBHOOK_URL")
-        exit(1)
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    # Thêm các handler VÀO ĐÂY (trước khi initialize)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate))
-
-    # --- Cấu hình Webhook cho Telegram Bot ---
-    telegram_webhook_path = f'/{TOKEN}'
-    telegram_webhook_url_full = f'{WEBHOOK_URL}{telegram_webhook_path}'
-
-    async def setup_webhook_and_initialize(): # Đổi tên hàm để rõ ràng hơn
-        # KHỞI TẠO APPLICATION TRƯỚC KHI XỬ LÝ BẤT KỲ UPDATE NÀO
-        print("Initializing Telegram Application...")
-        await app.initialize() # <--- DÒNG MỚI QUAN TRỌNG NHẤT
-
-        print("Thiết lập webhook với Telegram...")
-        try:
-            await app.bot.set_webhook(url=telegram_webhook_url_full)
-            print(f"Webhook đã được thiết lập thành công: {telegram_webhook_url_full}")
-        except Exception as e:
-            print(f"Lỗi khi thiết lập webhook với Telegram: {e}")
-            pass
-
-    # Chạy hàm async để thiết lập webhook và khởi tạo
-    asyncio.run(setup_webhook_and_initialize())
-
-    # Flask route để nhận updates từ Telegram
-    @flask_app.route(telegram_webhook_path, methods=['POST'])
-    async def telegram_update_handler():
-        print("Received POST request on Telegram webhook endpoint.")
-        if request.json:
-            print(f"Request JSON: {request.json}")
-            try:
-                update = Update.de_json(request.get_json(force=True), app.bot)
-                print(f"Successfully parsed Telegram update: {update.update_id}")
-                await app.process_update(update)
-                print("Finished processing Telegram update.")
-                return "ok", 200
-            except Exception as e:
-                print(f"Error processing Telegram update: {e}")
-                return "Error processing update", 500
+    try:
+        # Hiển thị đang typing
+        await update.message.chat.send_action("typing")
+        
+        # Thực hiện dịch
+        translated = await libre_translate(text)
+        
+        if translated:
+            response_text = (
+                f"🔄 Bản dịch:\n"
+                f"{translated}\n\n"
+                f"📝 Văn bản gốc:\n"
+                f"{text}"
+            )
+            logger.info(f"Translation successful for user {user.id}")
         else:
-            print("Received POST request with no JSON data or invalid JSON.")
-            return "Invalid request", 400
+            response_text = "⚠️ Có lỗi xảy ra khi dịch văn bản. Vui lòng thử lại sau."
+            logger.error(f"Translation failed for user {user.id}")
+        
+        await update.message.reply_text(response_text)
+        
+    except Exception as e:
+        logger.error(f"Error while translating for user {user.id}: {str(e)}")
+        await update.message.reply_text("⚠️ Có lỗi xảy ra. Vui lòng thử lại sau.")
 
-    print("Bot đang chạy và sẵn sàng nhận updates...")
-    flask_app.run(host="0.0.0.0", port=PORT)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan manager for FastAPI application."""
+    global application
+    
+    # Lấy environment variables
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+    
+    if not TOKEN or not WEBHOOK_URL:
+        raise ValueError("Missing required environment variables")
+
+    try:
+        # Khởi tạo application
+        application = (
+            ApplicationBuilder()
+            .token(TOKEN)
+            .build()
+        )
+        
+        # Đăng ký handlers
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_text))
+        
+        # Khởi tạo application và webhook
+        await application.initialize()
+        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
+        logger.info(f"Webhook set up at {WEBHOOK_URL}/{TOKEN}")
+        
+        yield
+        
+    except Exception as e:
+        logger.error(f"Error during startup: {str(e)}")
+        raise
+    finally:
+        # Cleanup
+        if application:
+            await application.shutdown()
+            logger.info("Application shutdown complete")
+
+# FastAPI routes
+@app.get("/")
+async def root():
+    """Root endpoint for health check."""
+    return {"status": "active", "timestamp": asyncio.get_event_loop().time()}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok"}
+
+@app.post(f"/{{token}}")
+async def telegram_webhook(token: str, request: Request):
+    """Webhook endpoint for Telegram updates."""
+    global application
+    
+    if token != os.getenv("TELEGRAM_BOT_TOKEN"):
+        logger.warning(f"Invalid token received: {token[:10]}...")
+        return {"status": "error", "message": "Invalid token"}
+    
+    try:
+        update = Update.de_json(await request.json(), application.bot)
+        await application.process_update(update)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error processing update: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+if __name__ == "__main__":
+    # Chạy với uvicorn khi chạy trực tiếp
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(
+        "bot:app",
+        host="0.0.0.0",
+        port=port,
+        workers=1,
+        reload=False
+    )
