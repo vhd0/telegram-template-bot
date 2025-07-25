@@ -23,7 +23,7 @@ from telegram.ext import (
 # Logging configuration
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO # Default logging level remains INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,11 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.2" # Updated version to reflect fix for degraded health check
+VERSION = "1.2.3" # Updated version to reflect log level change for health check
 
 # Emoji map for messages
 EMOJI = {
-    'hello': '�',
+    'hello': '👋',
     'translate': '🔄',
     'warning': '⚠️',
     'info': 'ℹ️',
@@ -441,6 +441,7 @@ async def health_check():
     uptime = current_time - bot._start_time
         
     if not bot._initialized:
+        # If bot is not initialized, always log at WARNING and return 503
         logger.warning(f"Health check failed: Bot not initialized. Uptime: {uptime.total_seconds()}s")
         raise HTTPException(
             status_code=503, # Service Unavailable if bot is not initialized
@@ -476,8 +477,12 @@ async def health_check():
             "translation": translation_status
         }
     }
-        
-    logger.info(f"Health check: {response['status']}")
+    
+    # Log 'ok' status at DEBUG level, 'degraded'/'error' at INFO level
+    if overall_status == "ok":
+        logger.debug(f"Health check: {response['status']}")
+    else:
+        logger.info(f"Health check: {response['status']}")
         
     return response
 
@@ -529,3 +534,4 @@ if __name__ == "__main__":
         
     server = uvicorn.Server(config)
     server.run()
+
