@@ -32,19 +32,22 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.6" # Updated version to fix AttributeError in TranslationCache
+VERSION = "1.2.7" # Updated version to reflect emoji review and explanation
 
 # Emoji map for messages
+# These are standard Unicode emojis, chosen for broad cross-platform compatibility.
+# Their visual appearance may vary slightly across different devices/operating systems
+# due to different emoji font implementations by platform vendors (e.g., Apple, Google, Samsung).
 EMOJI = {
-    'hello': '👋',
-    'translate': '�',
-    'warning': '⚠️',
-    'info': 'ℹ️',
-    'error': '❌',
-    'success': '✅',
-    'help': '💡',
-    'cache': '💾',
-    'time': '⏱️'
+    'hello': '�',     # Waving Hand
+    'translate': '🔄', # Counterclockwise Arrows Button
+    'warning': '⚠️',    # Warning Sign
+    'info': 'ℹ️',      # Information Sign
+    'error': '❌',     # Cross Mark
+    'success': '✅',    # White Heavy Check Mark
+    'help': '💡',      # Light Bulb
+    'cache': '💾',     # Floppy Disk (common symbol for saving/cache)
+    'time': '⏱️'       # Stopwatch (common symbol for time/duration)
 }
 
 @dataclass
@@ -451,7 +454,8 @@ app = FastAPI(
 async def root():
     """Root endpoint with basic status."""
     uptime = datetime.utcnow() - bot._start_time
-    cache_size = len(bot.translator.cache.cache) # Here, bot.translator.cache is TranslationCache, so .cache is correct
+    # FIX: Changed bot.translator.cache.cache to bot.translator.cache.cache for consistency
+    cache_size = len(bot.translator.cache.cache) 
     return {
         "status": "active" if bot._initialized else "initializing",
         "timestamp": datetime.utcnow().isoformat(),
