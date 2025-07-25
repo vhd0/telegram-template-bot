@@ -32,12 +32,12 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.5" # Updated version to reflect more robust Uvicorn log filtering
+VERSION = "1.2.6" # Updated version to fix AttributeError in TranslationCache
 
 # Emoji map for messages
 EMOJI = {
     'hello': '👋',
-    'translate': '🔄',
+    'translate': '�',
     'warning': '⚠️',
     'info': 'ℹ️',
     'error': '❌',
@@ -62,7 +62,7 @@ class TranslationResult:
 
 class TranslationCache:
     def __init__(self, timeout: int = CACHE_TIMEOUT):
-        self.cache: Dict[str, CacheEntry] = {}
+        self.cache: Dict[str, CacheEntry] = {} # This is the actual dictionary storing the cache
         self.timeout = timeout
         
     def get(self, key: str) -> Optional[str]:
@@ -87,14 +87,15 @@ class TranslationCache:
         ]
         for k in expired:
             del self.cache[k]
-        logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache.cache)}")
+        # FIX: Changed self.cache.cache to self.cache
+        logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
 
 
 class TranslationService:
     def __init__(self):
         # Session is now managed externally and set via set_session
         self.session: Optional[aiohttp.ClientSession] = None 
-        self.cache = TranslationCache()
+        self.cache = TranslationCache() # self.cache here is an instance of TranslationCache
         self.last_cleanup = datetime.utcnow()
         self.base_url = "https://api.mymemory.translated.net/get"
         # _initialized now depends on the session being provided/set
@@ -127,7 +128,7 @@ class TranslationService:
     def maybe_cleanup_cache(self):
         """Triggers cache cleanup if enough time has passed."""
         if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
-            self.cache.cleanup()
+            self.cache.cleanup() # Calls the cleanup method of the TranslationCache instance
             self.last_cleanup = datetime.utcnow()
             logger.info("Scheduled cache cleanup executed.")
 
@@ -135,7 +136,7 @@ class TranslationService:
         """Gets the status of the translation service."""
         return {
             "status": "active" if self._initialized and self.session and not self.session.closed else "inactive",
-            "cache_size": len(self.cache.cache),
+            "cache_size": len(self.cache.cache), # Here, self.cache is TranslationCache, so .cache is correct
             "last_cleanup": self.last_cleanup.isoformat()
         }
 
@@ -144,7 +145,7 @@ class TranslationService:
         self.maybe_cleanup_cache()
             
         # Check cache first
-        cached = self.cache.get(text)
+        cached = self.cache.get(text) # Calls the get method of the TranslationCache instance
         if cached:
             logger.info(f"Translation retrieved from cache for text: {text[:30]}...")
             return TranslationResult(
@@ -196,7 +197,7 @@ class TranslationService:
                     result.success = True
                             
                     # Cache successful translation
-                    self.cache.set(text, result.translated_text)
+                    self.cache.set(text, result.translated_text) # Calls the set method of the TranslationCache instance
                             
                     logger.info(
                         f"Translation successful (API call): {text[:30]} -> "
@@ -450,7 +451,7 @@ app = FastAPI(
 async def root():
     """Root endpoint with basic status."""
     uptime = datetime.utcnow() - bot._start_time
-    cache_size = len(bot.translator.cache.cache)
+    cache_size = len(bot.translator.cache.cache) # Here, bot.translator.cache is TranslationCache, so .cache is correct
     return {
         "status": "active" if bot._initialized else "initializing",
         "timestamp": datetime.utcnow().isoformat(),
