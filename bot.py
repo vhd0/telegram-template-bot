@@ -39,7 +39,7 @@ VERSION = "1.2.7" # Updated version to reflect emoji review and explanation
 # Their visual appearance may vary slightly across different devices/operating systems
 # due to different emoji font implementations by platform vendors (e.g., Apple, Google, Samsung).
 EMOJI = {
-    'hello': '�',     # Waving Hand
+    'hello': '👋',     # Waving Hand
     'translate': '🔄', # Counterclockwise Arrows Button
     'warning': '⚠️',    # Warning Sign
     'info': 'ℹ️',      # Information Sign
