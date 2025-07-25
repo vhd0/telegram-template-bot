@@ -32,7 +32,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.4" # Updated version to reflect Uvicorn log filtering
+VERSION = "1.2.5" # Updated version to reflect more robust Uvicorn log filtering
 
 # Emoji map for messages
 EMOJI = {
@@ -372,10 +372,16 @@ class HealthCheckFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         # Check if the log is from uvicorn.access logger and if it's an INFO level GET /health 200 OK
         if record.name == "uvicorn.access" and record.levelno == logging.INFO:
-            # Uvicorn's access log message format usually contains method, path, and status code
-            # Example: "GET /health HTTP/1.1" 200 OK
-            if "GET /health HTTP/1.1" in record.getMessage() and " 200 OK" in record.getMessage():
-                return False  # Do not log this record
+            # Uvicorn's access log message format typically puts method, path, and status code in record.args
+            # record.args will be a tuple like ('10.209.26.200:46028', 'GET', '/health', 'HTTP/1.1', 200)
+            try:
+                # Check if it's a GET request to /health and the status code is 200
+                if record.args[1] == 'GET' and record.args[2] == '/health' and record.args[4] == 200:
+                    return False  # Do not log this record
+            except (IndexError, TypeError):
+                # Handle cases where record.args might not have the expected structure
+                # In such cases, we let the log pass, or log a warning for debugging the filter itself
+                pass
         return True # Log all other records
 
 @asynccontextmanager
