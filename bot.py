@@ -32,7 +32,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.3" # Updated version to reflect log level change for health check
+VERSION = "1.2.4" # Updated version to reflect Uvicorn log filtering
 
 # Emoji map for messages
 EMOJI = {
@@ -367,15 +367,31 @@ class TelegramBot:
 # Initialize bot instance globally
 bot = TelegramBot()
 
+# Custom log filter to suppress Uvicorn's INFO logs for /health endpoint
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Check if the log is from uvicorn.access logger and if it's an INFO level GET /health 200 OK
+        if record.name == "uvicorn.access" and record.levelno == logging.INFO:
+            # Uvicorn's access log message format usually contains method, path, and status code
+            # Example: "GET /health HTTP/1.1" 200 OK
+            if "GET /health HTTP/1.1" in record.getMessage() and " 200 OK" in record.getMessage():
+                return False  # Do not log this record
+        return True # Log all other records
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Add the custom filter to uvicorn.access logger at startup
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    health_filter = HealthCheckFilter()
+    uvicorn_access_logger.addFilter(health_filter)
+    logger.info("Uvicorn health check log filter added.")
+
     # Startup tasks: Initialize bot and translation service session
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     webhook_url = os.getenv("WEBHOOK_URL")
         
     if not token or not webhook_url:
         logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Exiting.")
-        # This will prevent the application from starting if environment variables are missing
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
 
     # Create aiohttp session for the TranslationService at startup
@@ -398,6 +414,10 @@ async def lifespan(app: FastAPI):
         raise # Re-raise the exception to prevent the app from starting if init fails
         
     yield # Application is running and ready to handle requests
+
+    # Remove the custom filter at shutdown to clean up (good practice, though not strictly necessary for short-lived apps)
+    uvicorn_access_logger.removeFilter(health_filter)
+    logger.info("Uvicorn health check log filter removed.")
 
     # Shutdown tasks: Close bot and translation service sessions
     logger.info("Application shutdown initiated.")
