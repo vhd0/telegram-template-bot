@@ -6,7 +6,7 @@ import aiohttp
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -32,7 +32,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # Emoji map
 EMOJI = {
@@ -43,7 +43,8 @@ EMOJI = {
     'error': '❌',
     'success': '✅',
     'help': '💡',
-    'cache': '💾'
+    'cache': '💾',
+    'time': '⏱️'
 }
 
 @dataclass
@@ -90,10 +91,12 @@ class TranslationService:
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
         self.base_url = "https://api.mymemory.translated.net/get"
+        self._initialized = False
 
     async def ensure_session(self):
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
+            self._initialized = True
 
     def preprocess_text(self, text: str) -> str:
         """Chuẩn hóa text."""
@@ -117,6 +120,14 @@ class TranslationService:
         if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
             self.cache.cleanup()
             self.last_cleanup = datetime.utcnow()
+
+    async def get_service_status(self) -> Dict[str, Any]:
+        """Get translation service status."""
+        return {
+            "status": "active" if self._initialized and self.session and not self.session.closed else "inactive",
+            "cache_size": len(self.cache.cache),
+            "last_cleanup": self.last_cleanup.isoformat()
+        }
 
     async def translate(self, text: str) -> TranslationResult:
         """Dịch văn bản sử dụng MyMemory API."""
@@ -219,6 +230,28 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Bot initialization failed: {str(e)}")
             return False
+
+    async def get_bot_status(self) -> Dict[str, Any]:
+        """Get bot status information."""
+        try:
+            if self.application and self.application.bot:
+                me = await self.application.bot.get_me()
+                status = "active"
+                username = me.username
+            else:
+                status = "inactive"
+                username = None
+        except Exception as e:
+            logger.error(f"Bot status check failed: {str(e)}")
+            status = "error"
+            username = None
+
+        return {
+            "status": status,
+            "username": username,
+            "initialized": self._initialized,
+            "start_time": self._start_time.isoformat()
+        }
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -343,6 +376,7 @@ app = FastAPI(
 
 @app.get("/")
 async def root():
+    """Root endpoint with basic status."""
     uptime = datetime.utcnow() - bot._start_time
     cache_size = len(bot.translator.cache.cache)
     return {
@@ -355,17 +389,47 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    """Enhanced health check endpoint for uptime monitoring."""
+    current_time = datetime.utcnow()
+    uptime = current_time - bot._start_time
+    
     if not bot._initialized:
-        raise HTTPException(status_code=503, detail="Bot is not initialized")
-    return {
-        "status": "ok",
-        "bot_status": "active",
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "status": "error",
+                "message": "Bot is not initialized",
+                "timestamp": current_time.isoformat(),
+                "uptime_seconds": uptime.total_seconds()
+            }
+        )
+
+    # Get detailed status
+    bot_status = await bot.get_bot_status()
+    translation_status = await bot.translator.get_service_status()
+
+    response = {
+        "status": "ok" if bot_status["status"] == "active" and translation_status["status"] == "active" else "degraded",
+        "timestamp": current_time.isoformat(),
         "version": VERSION,
-        "cache_size": len(bot.translator.cache.cache)
+        "uptime": {
+            "seconds": int(uptime.total_seconds()),
+            "formatted": str(uptime).split('.')[0]  # HH:MM:SS format
+        },
+        "services": {
+            "bot": bot_status,
+            "translation": translation_status
+        }
     }
+    
+    # Log health check
+    logger.info(f"Health check: {response['status']}")
+    
+    return response
 
 @app.post("/{token}")
 async def telegram_webhook(token: str, request: Request):
+    """Handle Telegram webhook requests."""
     if not bot._initialized:
         raise HTTPException(status_code=503, detail="Bot is not initialized")
     
