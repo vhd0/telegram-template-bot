@@ -33,7 +33,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.5.0" # Updated version for explicit auto-detect source language
+VERSION = "1.6.0" # Updated version for robust auto-detect source language
 
 # Language options for dynamic translation
 # Maps language codes (used by MyMemory API) to display names
@@ -108,8 +108,8 @@ class TranslationService:
         self.session: Optional[aiohttp.ClientSession] = None 
         self.cache = TranslationCache() # self.cache here is an instance of TranslationCache
         self.last_cleanup = datetime.utcnow()
-        self.base_url = "https://api.mymemory.translated.net/get" # Base URL for translation
-        self.detect_url = "https://api.mymemory.translated.net/detect" # URL for language detection
+        self.base_url = "https://api.mymemory.translated.net/get" # Base URL for translation (used for both translate & detect implicitly)
+        # self.detect_url = "https://api.mymemory.translated.net/detect" # Removed: this endpoint returns 404
         # _initialized now depends on the session being provided/set
         self._initialized = False
 
@@ -153,51 +153,71 @@ class TranslationService:
         }
 
     async def translate(self, text: str, target_lang: str) -> TranslationResult:
-        """Translates text using the MyMemory API with a preceding language detection step."""
+        """
+        Translates text using the MyMemory API.
+        This function now attempts to auto-detect source language using the main /get endpoint
+        and performs a re-translation if needed.
+        """
         self.maybe_cleanup_cache()
 
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text)
 
         if not self.session or self.session.closed:
-            logger.error("TranslationService session is not active. Cannot proceed with detection or translation.")
+            logger.error("TranslationService session is not active. Cannot proceed with translation.")
             return TranslationResult(
                 original_text=text,
                 success=False,
                 error_message="Dịch vụ dịch chưa sẵn sàng."
             )
 
-        # --- Step 1: Detect Source Language ---
-        detected_source_lang = None
-        detect_params = {"q": processed_text}
+        # --- Step 1: Initial API call for potential auto-detection and translation ---
+        # Make the first call without a specific source language.
+        # MyMemory often auto-detects and translates to a common language (like English)
+        # or the default target if no langpair is provided. We will use this to get detected_source_lang.
+        initial_params = {
+            "q": processed_text,
+            "de": "a@b.c" # Email for better rate limits
+        }
         
+        detected_source_lang = None
+        initial_translated_text = None
+
         for attempt in range(RETRY_COUNT):
             try:
                 async with self.session.get(
-                    self.detect_url,
-                    params=detect_params,
-                    timeout=aiohttp.ClientTimeout(total=5) # Shorter timeout for detection
+                    self.base_url,
+                    params=initial_params,
+                    timeout=aiohttp.ClientTimeout(total=5) # Shorter timeout for initial detection/translation
                 ) as response:
-                    response.raise_for_status() # Raises HTTPError for bad responses (4xx, 5xx)
-                    detect_data = await response.json()
+                    response.raise_for_status()
+                    data = await response.json()
                     
-                    # MyMemory detect API response structure: {"matches": [{"lang": "en", ...}]}
-                    if detect_data and "matches" in detect_data and detect_data["matches"]:
-                        detected_source_lang = detect_data["matches"][0].get("lang")
-                        if detected_source_lang:
-                            logger.info(f"Detected source language: {detected_source_lang} for text: {processed_text[:30]}...")
-                            break # Exit retry loop on successful detection
+                    if not data or "responseData" not in data:
+                        raise ValueError("Invalid response format from MyMemory API for initial call.")
+
+                    # Try to get detected language from response
+                    # MyMemory might return `detectedLanguage` or it might be in `matches`
+                    detected_source_lang = data.get("detectedLanguage")
+                    if not detected_source_lang and "matches" in data and data["matches"]:
+                        detected_source_lang = data["matches"][0].get("lang")
+
+                    initial_translated_text = data["responseData"].get("translatedText")
+
+                    if detected_source_lang:
+                        logger.info(f"Initial call: Detected source language: {detected_source_lang} for text: {processed_text[:30]}...")
+                        break # Exit retry loop on successful detection
                     else:
-                        raise ValueError("Could not detect source language from API response (no matches found).")
+                        raise ValueError("Could not detect source language from initial API response.")
             except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Language detection attempt {attempt + 1}/{RETRY_COUNT} failed: {e}", exc_info=True)
-                result.error_message = "Không thể phát hiện ngôn ngữ đầu vào."
+                logger.error(f"Initial API call attempt {attempt + 1}/{RETRY_COUNT} failed: {e}", exc_info=True)
+                result.error_message = "Không thể phát hiện ngôn ngữ đầu vào hoặc nhận bản dịch ban đầu."
                 if attempt < RETRY_COUNT - 1:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
-                    return result # Return early if detection fails after retries
+                    return result # Return early if initial call fails after retries
             except Exception as e:
-                logger.error(f"Unexpected error during language detection (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                logger.error(f"Unexpected error during initial API call (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = "Đã xảy ra lỗi không xác định khi phát hiện ngôn ngữ."
                 if attempt < RETRY_COUNT - 1:
                     await asyncio.sleep(RETRY_DELAY)
@@ -208,22 +228,21 @@ class TranslationService:
             result.error_message = "Không thể phát hiện ngôn ngữ đầu vào sau nhiều lần thử."
             return result
 
-        # If detected source language is the same as target language, and they are valid,
-        # return the original text directly and mark as success (no translation needed)
+        # --- Step 2: Determine if a second translation call is needed ---
+        # If detected source language is the same as target language, or if the initial translation is sufficient
         if detected_source_lang == target_lang and detected_source_lang in LANG_OPTIONS:
-            logger.info(f"Source language ({detected_source_lang}) is same as target language. Skipping translation.")
+            logger.info(f"Source language ({detected_source_lang}) is same as target language. Using initial text as translation.")
             return TranslationResult(
                 original_text=text,
-                translated_text=text, # Original text is the "translation"
+                translated_text=self.postprocess_translation(processed_text), # Return original text (processed)
                 success=True,
-                from_cache=False # Not from cache as no API call was made
+                from_cache=False # Not from cache as no specific translation API call was made
             )
-
-        # --- Step 2: Translate using Detected Language ---
+        
         # Construct cache key with detected source language and target language
         cache_key = f"{detected_source_lang}_{processed_text}|{target_lang}"
 
-        # Check cache again with the new specific key
+        # Check cache again with the new specific key before making a second API call
         cached = self.cache.get(cache_key)
         if cached:
             logger.info(f"Translation retrieved from cache for text: {processed_text[:30]}... ({detected_source_lang} -> {target_lang})")
@@ -234,50 +253,50 @@ class TranslationService:
                 from_cache=True
             )
 
-        # Form the langpair using the detected source language
+        # If detected source is different from target, proceed with second API call for explicit translation
+        # --- Step 3: Explicit Translation using Detected Language ---
         langpair = f"{detected_source_lang}|{target_lang}"
-        params = {
+        final_translation_params = {
             "q": processed_text,
             "langpair": langpair,
-            "de": "a@b.c" # Email for better rate limits, as per MyMemory API docs
+            "de": "a@b.c"
         }
 
-        # Original translation retry logic remains similar
         for attempt in range(RETRY_COUNT):
             try:
                 async with self.session.get(
                     self.base_url,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10) # 10 seconds timeout for the request
+                    params=final_translation_params,
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     response.raise_for_status()
                     data = await response.json()
 
                     if not data or "responseData" not in data or not data["responseData"].get("translatedText"):
-                        raise ValueError("Invalid or empty translation response.")
+                        raise ValueError("Invalid or empty final translation response.")
 
                     translated_text = data["responseData"].get("translatedText")
 
                     result.translated_text = self.postprocess_translation(translated_text)
                     result.success = True
                     self.cache.set(cache_key, result.translated_text)
-                    logger.info(f"Translation successful (API call): {processed_text[:30]} -> {result.translated_text[:30]} ({detected_source_lang} -> {target_lang})")
+                    logger.info(f"Final translation successful (API call): {processed_text[:30]} -> {result.translated_text[:30]} ({detected_source_lang} -> {target_lang})")
                     return result
 
             except aiohttp.ClientError as e:
-                logger.error(f"HTTP Client Error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                logger.error(f"HTTP Client Error during final translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = f"Lỗi kết nối dịch vụ dịch: {e}"
             except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                logger.error(f"Final translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = f"Lỗi dữ liệu dịch: {e}"
             except Exception as e:
-                logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                logger.error(f"Unexpected error during final translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
 
             if attempt < RETRY_COUNT - 1:
                 await asyncio.sleep(RETRY_DELAY)
             else:
-                logger.error(f"All {RETRY_COUNT} translation attempts failed for text: {text[:50]}... ({detected_source_lang} -> {target_lang})")
+                logger.error(f"All {RETRY_COUNT} final translation attempts failed for text: {text[:50]}... ({detected_source_lang} -> {target_lang})")
 
         result.error_message = result.error_message or "Không thể dịch văn bản. Vui lòng thử lại sau."
         return result
