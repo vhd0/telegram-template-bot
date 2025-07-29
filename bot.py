@@ -397,12 +397,12 @@ class TelegramBot:
         keyboard = [
             [
                 InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data=f"translate_to:vi"),
-                InlineKeyboardButton("🇯🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
+                InlineKeyboardButton("�🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # Removed explicit language detection message from here
+        # Prompt for target language selection
         await update.message.reply_text(
             f"{EMOJI['translate']} Bạn muốn dịch sang ngôn ngữ nào?",
             reply_markup=reply_markup,
@@ -416,7 +416,7 @@ class TelegramBot:
         """
         query = update.callback_query
         user = query.from_user
-        await query.answer()
+        await query.answer() # Acknowledge the callback query immediately
 
         chat_id = query.message.chat_id
         
@@ -445,12 +445,7 @@ class TelegramBot:
         
         logger.info(f"User {user.id} chose to translate from {source_lang} to {target_lang} for text: '{original_text[:50]}...'")
 
-        # Send a "Translating..." message (kept for better UX, gives immediate feedback)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{EMOJI['translate']} Đang dịch từ **{source_lang.upper()}** sang **{target_lang.upper()}**...",
-            parse_mode="Markdown"
-        )
+        # Set typing status to indicate processing (still good for UX feedback)
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         
         try:
@@ -479,6 +474,7 @@ class TelegramBot:
                      "Đã xảy ra lỗi. Vui lòng thử lại sau."
             )
         finally:
+            # Clean up user data after translation is attempted
             if user.id in context.user_data:
                 del context.user_data[user.id]
                 logger.debug(f"Cleaned up user_data for user {user.id}")
