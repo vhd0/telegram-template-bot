@@ -10,14 +10,15 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     filters,
-    ContextTypes
+    ContextTypes,
+    CallbackQueryHandler # Import CallbackQueryHandler
 )
 
 # Logging configuration
@@ -32,7 +33,15 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.2.7" # Updated version to reflect emoji review and explanation
+VERSION = "1.4.0" # Updated version for auto-detect source language
+
+# Language options for dynamic translation
+# Maps language codes (used by MyMemory API) to display names
+LANG_OPTIONS = {
+    "vi": "Tiếng Việt",
+    "ja": "Tiếng Nhật",
+    "en": "Tiếng Anh"
+}
 
 # Emoji map for messages
 # These are standard Unicode emojis, chosen for broad cross-platform compatibility.
@@ -90,7 +99,6 @@ class TranslationCache:
         ]
         for k in expired:
             del self.cache[k]
-        # FIX: Changed self.cache.cache to self.cache
         logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
 
 
@@ -143,14 +151,17 @@ class TranslationService:
             "last_cleanup": self.last_cleanup.isoformat()
         }
 
-    async def translate(self, text: str) -> TranslationResult:
-        """Translates text using the MyMemory API."""
+    async def translate(self, text: str, target_lang: str) -> TranslationResult:
+        """Translates text using the MyMemory API with auto-detection for source language."""
         self.maybe_cleanup_cache()
-            
+        
+        # Construct cache key with target language (source lang is auto-detected)
+        cache_key = f"auto_{text}|{target_lang}" # Added "auto_" prefix to cache key
+        
         # Check cache first
-        cached = self.cache.get(text) # Calls the get method of the TranslationCache instance
+        cached = self.cache.get(cache_key)
         if cached:
-            logger.info(f"Translation retrieved from cache for text: {text[:30]}...")
+            logger.info(f"Translation retrieved from cache for text: {text[:30]}... to {target_lang} (auto-detected source)")
             return TranslationResult(
                 original_text=text,
                 translated_text=cached,
@@ -160,7 +171,6 @@ class TranslationService:
             
         # Ensure session is available before making API call
         if not self.session or self.session.closed:
-            # This should ideally not happen if lifespan manages the session correctly
             logger.error("TranslationService session is not active. Cannot translate.")
             return TranslationResult(
                 original_text=text,
@@ -171,10 +181,12 @@ class TranslationService:
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text)
             
+        # Dynamic langpair: auto-detect source language and translate to target_lang
+        langpair = f"auto|{target_lang}" # Changed from DEFAULT_SOURCE_LANG to "auto"
         params = {
             "q": processed_text,
-            "langpair": "vi|ja", # Translate from Vietnamese to Japanese
-            "de": "a@b.c"  # Email for better rate limits, as per MyMemory API docs
+            "langpair": langpair,
+            "de": "a@b.c" # Email for better rate limits, as per MyMemory API docs
         }
 
         # Attempt translation with retries
@@ -193,18 +205,26 @@ class TranslationService:
                             
                     translated_text = data["responseData"].get("translatedText")
                     if not translated_text:
-                        raise ValueError("Empty translation received from MyMemory API.")
+                        # MyMemory API might return original text if it can't translate or detect
+                        # We consider it an error if translatedText is explicitly empty
+                        # However, for auto-detection, if original and translated text are identical,
+                        # it often means it couldn't translate.
+                        if data["responseData"].get("match") == 1.0 and translated_text == processed_text:
+                            logger.warning(f"MyMemory returned original text for auto-detection. Text: {processed_text[:30]}, Target: {target_lang}")
+                            raise ValueError("MyMemory API returned original text (likely cannot translate or detect source).")
+                        else:
+                            raise ValueError("Empty translation received from MyMemory API.")
                             
                     # Process and store the translation
                     result.translated_text = self.postprocess_translation(translated_text)
                     result.success = True
                             
-                    # Cache successful translation
-                    self.cache.set(text, result.translated_text) # Calls the set method of the TranslationCache instance
+                    # Cache successful translation with lang_code in key
+                    self.cache.set(cache_key, result.translated_text)
                             
                     logger.info(
                         f"Translation successful (API call): {text[:30]} -> "
-                        f"{result.translated_text[:30]}"
+                        f"{result.translated_text[:30]} (to {target_lang}, source auto-detected)"
                     )
                             
                     return result
@@ -254,8 +274,16 @@ class TelegramBot:
             # Register handlers for commands and text messages
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CommandHandler("help", self.help_command))
+            
+            # MessageHandler for general text messages
             self.application.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self.translate_text)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, self.prompt_language_selection)
+            )
+            
+            # CallbackQueryHandler for inline button presses
+            # It matches callback_data that starts with "lang_"
+            self.application.add_handler(
+                CallbackQueryHandler(self.handle_language_selection, pattern=r"^lang_")
             )
                 
             await self.application.initialize()
@@ -296,8 +324,8 @@ class TelegramBot:
         welcome_text = (
             f"{EMOJI['hello']} こんにちは {user.first_name}さん！\n\n"
             f"{EMOJI['info']} Bot dịch văn bản Việt-Nhật\n"
-            f"{EMOJI['translate']} Gửi tin nhắn để nhận bản dịch\n"
-            f"{EMOJI['help']} Gõ /help để xem hướng dẫn"
+            f"{EMOJI['translate']} Gửi tin nhắn để nhận bản dịch đa ngôn ngữ.\n"
+            f"{EMOJI['help']} Gõ /help để xem hướng dẫn."
         )
         await update.message.reply_text(welcome_text)
 
@@ -307,19 +335,22 @@ class TelegramBot:
             
         help_text = (
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
-            "1. Gửi văn bản tiếng Việt\n"
-            "2. Bot sẽ dịch sang tiếng Nhật\n"
-            "3. Bản dịch sẽ được gửi riêng để dễ copy\n"
+            "1. Gửi văn bản bất kỳ ngôn ngữ nào.\n" # Updated instructions
+            "2. Bot sẽ yêu cầu bạn chọn ngôn ngữ đích (Tiếng Việt, Tiếng Nhật, Tiếng Anh).\n"
+            "3. Chọn ngôn ngữ và nhận bản dịch.\n"
             "4. /start - Bắt đầu sử dụng\n"
             "5. /help - Xem hướng dẫn\n\n"
             f"{EMOJI['help']} Mẹo:\n"
-            "• Viết câu đầy đủ và rõ ràng\n"
-            f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự"
+            "• Viết câu đầy đủ và rõ ràng để bot phát hiện ngôn ngữ tốt nhất.\n" # Updated tip
+            f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự."
         )
         await update.message.reply_text(help_text)
 
-    async def translate_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handles text messages for translation."""
+    async def prompt_language_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Stores the user's text and prompts them to select a target language
+        using inline keyboard buttons.
+        """
         user = update.effective_user
         text = update.message.text.strip()
             
@@ -336,36 +367,93 @@ class TelegramBot:
             )
             return
 
-        logger.info(f"Translating for user {user.id}: '{text[:50]}...'")
+        logger.info(f"User {user.id} sent text for translation: '{text[:50]}...'")
+        
+        # Store the text in user_data for later retrieval by the callback handler
+        context.user_data['pending_translation_text'] = text
+        
+        # Create inline keyboard buttons for language selection
+        keyboard = []
+        for lang_code, lang_name in LANG_OPTIONS.items():
+            # Callback data format: "lang_<language_code>"
+            keyboard.append([InlineKeyboardButton(lang_name, callback_data=f"lang_{lang_code}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"{EMOJI['translate']} Bạn muốn dịch sang ngôn ngữ nào?",
+            reply_markup=reply_markup
+        )
+
+    async def handle_language_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handles the inline keyboard button press for language selection,
+        then proceeds with translation.
+        """
+        query = update.callback_query
+        user = query.from_user
+        
+        # Always answer callback queries to remove the loading animation on the button
+        await query.answer()
+
+        # Extract the language code from callback_data (e.g., "lang_ja" -> "ja")
+        target_lang_code = query.data.split('_')[1]
+        target_lang_name = LANG_OPTIONS.get(target_lang_code, "ngôn ngữ không xác định")
+
+        logger.info(f"User {user.id} selected target language: {target_lang_name} ({target_lang_code})")
+
+        # Retrieve the pending text from user_data
+        text_to_translate = context.user_data.pop('pending_translation_text', None)
+
+        if not text_to_translate:
+            # This case might happen if bot restarted or user clicked old button
+            await query.edit_message_text(
+                f"{EMOJI['warning']} Không tìm thấy văn bản để dịch. Vui lòng gửi lại tin nhắn mới."
+            )
+            logger.warning(f"No pending text found for user {user.id} on language selection.")
+            return
+
+        # Delete the inline keyboard message to prevent user from clicking it again
+        # and to clean up the chat.
+        try:
+            await query.edit_message_text(
+                f"{EMOJI['translate']} Đang dịch văn bản sang {target_lang_name} (phát hiện ngôn ngữ đầu vào tự động)..." # Updated message
+            )
+        except Exception as e:
+            logger.warning(f"Could not edit message text after language selection: {e}")
+            await query.message.reply_text(
+                f"{EMOJI['translate']} Đang dịch văn bản sang {target_lang_name} (phát hiện ngôn ngữ đầu vào tự động)..." # Updated message
+            )
+
+        logger.info(f"Translating for user {user.id}: '{text_to_translate[:50]}...' to {target_lang_code} (auto-detect source)")
             
         try:
-            await update.message.chat.send_action("typing") # Show "typing..." status to the user
+            await query.message.chat.send_action("typing") 
                 
-            result = await self.translator.translate(text)
+            result = await self.translator.translate(text_to_translate, target_lang_code)
                 
             if result.success and result.translated_text:
-                # Short confirmation message
-                await update.message.reply_text(
-                    f"{EMOJI['translate']} Bản dịch:" +
-                    (f" {EMOJI['cache']}" if result.from_cache else "") # Indicate if translation came from cache
+                # Send confirmation message
+                await query.message.reply_text(
+                    f"{EMOJI['translate']} Bản dịch sang {target_lang_name}:" +
+                    (f" {EMOJI['cache']}" if result.from_cache else "")
                 )
                     
-                # The translation itself in a separate message for easy copying
-                await update.message.reply_text(result.translated_text)
+                # Send the translated text
+                await query.message.reply_text(result.translated_text)
                     
-                logger.info(f"Translation successful for user {user.id}")
+                logger.info(f"Translation successful for user {user.id} to {target_lang_code}")
             else:
-                await update.message.reply_text(
-                    f"{EMOJI['error']} 申し訳ございません。\n"
-                    f"{result.error_message or '翻訳エラーが発生しました。'}" # Fallback error message if no specific error
+                await query.message.reply_text(
+                    f"{EMOJI['error']} Xin lỗi, không thể dịch.\n"
+                    f"{result.error_message or 'Đã xảy ra lỗi khi dịch.'}"
                 )
                 logger.error(f"Translation failed for user {user.id}: {result.error_message}")
                 
         except Exception as e:
-            logger.error(f"Error while translating for user {user.id} (text: '{text[:50]}...'): {e}", exc_info=True)
-            await update.message.reply_text(
-                f"{EMOJI['error']} エラーが発生しました。\n"
-                "Đã xảy ra lỗi. Vui lòng thử lại sau."
+            logger.error(f"Error during translation process for user {user.id}: {e}", exc_info=True)
+            await query.message.reply_text(
+                f"{EMOJI['error']} Đã xảy ra lỗi. Vui lòng thử lại sau."
             )
 
 # Initialize bot instance globally
@@ -454,7 +542,6 @@ app = FastAPI(
 async def root():
     """Root endpoint with basic status."""
     uptime = datetime.utcnow() - bot._start_time
-    # FIX: Changed bot.translator.cache.cache to bot.translator.cache.cache for consistency
     cache_size = len(bot.translator.cache.cache) 
     return {
         "status": "active" if bot._initialized else "initializing",
