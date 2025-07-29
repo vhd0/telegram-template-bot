@@ -15,7 +15,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
-    MessageType,
+    # MessageType, # Removed: This import causes ImportError
     filters,
     ContextTypes,
     CallbackQueryHandler # Import CallbackQueryHandler
