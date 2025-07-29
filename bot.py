@@ -590,7 +590,8 @@ async def lifespan(app: FastAPI):
     """
     # Add the custom filter to uvicorn.access logger at startup
     uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    health_filter = Health-CheckFilter()
+    # Corrected: Removed the hyphen from Health-CheckFilter()
+    health_filter = HealthCheckFilter() 
     uvicorn_access_logger.addFilter(health_filter)
     logger.info("Uvicorn health check log filter added.")
 
