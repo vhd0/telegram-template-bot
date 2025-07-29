@@ -397,7 +397,7 @@ class TelegramBot:
         keyboard = [
             [
                 InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data=f"translate_to:vi"),
-                InlineKeyboardButton("�🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
+                InlineKeyboardButton("🇯🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
