@@ -15,7 +15,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
+    MessageType,
     filters,
     ContextTypes,
     CallbackQueryHandler # Import CallbackQueryHandler
@@ -33,7 +33,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.6.0" # Updated version for robust auto-detect source language
+VERSION = "1.7.0" # Updated version for more robust auto-detection fallback
 
 # Language options for dynamic translation
 # Maps language codes (used by MyMemory API) to display names
@@ -109,7 +109,6 @@ class TranslationService:
         self.cache = TranslationCache() # self.cache here is an instance of TranslationCache
         self.last_cleanup = datetime.utcnow()
         self.base_url = "https://api.mymemory.translated.net/get" # Base URL for translation (used for both translate & detect implicitly)
-        # self.detect_url = "https://api.mymemory.translated.net/detect" # Removed: this endpoint returns 404
         # _initialized now depends on the session being provided/set
         self._initialized = False
 
@@ -173,15 +172,13 @@ class TranslationService:
 
         # --- Step 1: Initial API call for potential auto-detection and translation ---
         # Make the first call without a specific source language.
-        # MyMemory often auto-detects and translates to a common language (like English)
-        # or the default target if no langpair is provided. We will use this to get detected_source_lang.
+        # MyMemory often auto-detects and translates. We will use this to get detected_source_lang.
         initial_params = {
             "q": processed_text,
             "de": "a@b.c" # Email for better rate limits
         }
         
         detected_source_lang = None
-        initial_translated_text = None
 
         for attempt in range(RETRY_COUNT):
             try:
@@ -196,42 +193,56 @@ class TranslationService:
                     if not data or "responseData" not in data:
                         raise ValueError("Invalid response format from MyMemory API for initial call.")
 
-                    # Try to get detected language from response
-                    # MyMemory might return `detectedLanguage` or it might be in `matches`
-                    detected_source_lang = data.get("detectedLanguage")
-                    if not detected_source_lang and "matches" in data and data["matches"]:
-                        detected_source_lang = data["matches"][0].get("lang")
-
-                    initial_translated_text = data["responseData"].get("translatedText")
+                    # Try to get detected language from responseData.detectedLanguage (most common for /get)
+                    detected_source_lang = data["responseData"].get("detectedLanguage")
+                    
+                    # Fallback to responseData.matches[0].source if responseData.detectedLanguage is not found
+                    # This covers cases where MyMemory provides detected language within the match details
+                    if not detected_source_lang and data["responseData"].get("matches"):
+                        if data["responseData"]["matches"] and data["responseData"]["matches"][0].get("source"):
+                            detected_source_lang = data["responseData"]["matches"][0].get("source")
+                    
+                    # If still not found, try top-level 'detectedLanguage' (less common for detection from /get)
+                    if not detected_source_lang:
+                        detected_source_lang = data.get("detectedLanguage")
 
                     if detected_source_lang:
                         logger.info(f"Initial call: Detected source language: {detected_source_lang} for text: {processed_text[:30]}...")
                         break # Exit retry loop on successful detection
                     else:
-                        raise ValueError("Could not detect source language from initial API response.")
+                        # If detected_source_lang is still None after all checks, log and try next attempt
+                        logger.warning(f"Could not extract detected language from API response for text: {processed_text[:30]}...")
+                        raise ValueError("No confident language detection in initial API response.") # Re-raise to trigger retry
             except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
                 logger.error(f"Initial API call attempt {attempt + 1}/{RETRY_COUNT} failed: {e}", exc_info=True)
                 result.error_message = "Không thể phát hiện ngôn ngữ đầu vào hoặc nhận bản dịch ban đầu."
                 if attempt < RETRY_COUNT - 1:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
-                    return result # Return early if initial call fails after retries
+                    # After all retries, if detection failed, assign a fallback language
+                    logger.warning(f"All {RETRY_COUNT} attempts to detect source language failed for text: {processed_text[:30]}... Falling back to 'en'.")
+                    detected_source_lang = "en" # Fallback to English
+                    result.error_message = "Không thể phát hiện ngôn ngữ đầu vào một cách chính xác. Đang thử dịch với ngôn ngữ mặc định (Tiếng Anh)."
+                    break # Break from retry loop to proceed with translation using fallback
             except Exception as e:
                 logger.error(f"Unexpected error during initial API call (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = "Đã xảy ra lỗi không xác định khi phát hiện ngôn ngữ."
                 if attempt < RETRY_COUNT - 1:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
-                    return result
+                    logger.warning(f"All {RETRY_COUNT} attempts to detect source language failed for text: {processed_text[:30]}... Falling back to 'en'.")
+                    detected_source_lang = "en" # Fallback to English
+                    result.error_message = "Đã xảy ra lỗi không xác định. Đang thử dịch với ngôn ngữ mặc định (Tiếng Anh)."
+                    break # Break from retry loop
         
-        if not detected_source_lang:
-            result.error_message = "Không thể phát hiện ngôn ngữ đầu vào sau nhiều lần thử."
+        if not detected_source_lang: # This block is reached if detected_source_lang is still None after all retries and fallbacks
+            result.error_message = result.error_message or "Không thể phát hiện ngôn ngữ đầu vào sau nhiều lần thử."
             return result
 
         # --- Step 2: Determine if a second translation call is needed ---
-        # If detected source language is the same as target language, or if the initial translation is sufficient
+        # If detected source language is the same as target language, use original text as translation
         if detected_source_lang == target_lang and detected_source_lang in LANG_OPTIONS:
-            logger.info(f"Source language ({detected_source_lang}) is same as target language. Using initial text as translation.")
+            logger.info(f"Source language ({detected_source_lang}) is same as target language. Using original text as translation.")
             return TranslationResult(
                 original_text=text,
                 translated_text=self.postprocess_translation(processed_text), # Return original text (processed)
