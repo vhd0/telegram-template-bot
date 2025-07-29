@@ -107,11 +107,9 @@ class LangDetectService:
         Returns the detected language code (e.g., 'en', 'vi', 'ja') or None on failure.
         """
         try:
-            # detect_langs returns a list of Language objects, e.g., [vi:0.99, en:0.01]
-            # We take the language code of the most probable detection.
             detections = detect_langs(text)
             if detections:
-                detected_lang = str(detections[0].lang) # Convert Language object to string code
+                detected_lang = str(detections[0].lang)
                 logger.info(f"Detected language for '{text[:30]}...': {detected_lang} (confidence: {detections[0].prob})")
                 return detected_lang
             else:
@@ -347,7 +345,7 @@ class TelegramBot:
             "1. Gửi bất kỳ văn bản nào bạn muốn dịch.\n"
             "2. Bot sẽ tự động nhận diện ngôn ngữ và hỏi bạn muốn dịch sang Tiếng Việt hay Tiếng Nhật.\n"
             "3. Nhấn vào nút ngôn ngữ bạn muốn dịch.\n"
-            "4. Bản dịch sẽ được gửi riêng để dễ copy.\n"
+            "4. Bản dịch sẽ được gửi.\n" # Simplified for brevity
             "5. /start - Bắt đầu sử dụng\n"
             "6. /help - Xem hướng dẫn\n\n"
             f"{EMOJI['help']} Mẹo:\n"
@@ -395,18 +393,18 @@ class TelegramBot:
         context.user_data[user.id] = {"original_text": text, "source_lang": detected_lang}
         logger.info(f"Detected language '{detected_lang}' for user {user.id}. Stored text and lang in user_data.")
 
-        # Create inline keyboard for target language selection with flags
+        # Create inline keyboard for target language selection with flags and concise text
         keyboard = [
             [
-                InlineKeyboardButton("Dịch sang Tiếng Việt 🇻🇳", callback_data=f"translate_to:vi"),
-                InlineKeyboardButton("Dịch sang Tiếng Nhật 🇯🇵", callback_data=f"translate_to:ja")
+                InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data=f"translate_to:vi"),
+                InlineKeyboardButton("🇯🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        # Removed explicit language detection message from here
         await update.message.reply_text(
-            f"{EMOJI['detect']} Đã nhận diện ngôn ngữ của bạn là **{detected_lang.upper()}**.\n"
-            "Bạn muốn dịch sang ngôn ngữ nào?",
+            f"{EMOJI['translate']} Bạn muốn dịch sang ngôn ngữ nào?",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -447,6 +445,7 @@ class TelegramBot:
         
         logger.info(f"User {user.id} chose to translate from {source_lang} to {target_lang} for text: '{original_text[:50]}...'")
 
+        # Send a "Translating..." message (kept for better UX, gives immediate feedback)
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"{EMOJI['translate']} Đang dịch từ **{source_lang.upper()}** sang **{target_lang.upper()}**...",
@@ -458,12 +457,11 @@ class TelegramBot:
             result = await self.translator.translate(original_text, source_lang, target_lang)
                 
             if result.success and result.translated_text:
+                # ONLY send the translated text for easy copying/forwarding
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"{EMOJI['translate']} Bản dịch:" +
-                         (f" {EMOJI['cache']}" if result.from_cache else "")
+                    text=result.translated_text
                 )
-                await context.bot.send_message(chat_id=chat_id, text=result.translated_text)
                 logger.info(f"Translation successful for user {user.id}")
             else:
                 await context.bot.send_message(
@@ -524,7 +522,7 @@ async def lifespan(app: FastAPI):
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
 
     global bot
-    bot = TelegramBot() # No longer requires google_api_key
+    bot = TelegramBot()
 
     aiohttp_session = None
     try:
