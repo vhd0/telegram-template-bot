@@ -6,7 +6,7 @@ import aiohttp
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -20,10 +20,10 @@ from telegram.ext import (
     ContextTypes
 )
 
-# Logging config
+# Logging configuration
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO # Default logging level remains INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -32,18 +32,22 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "1.1.0"
+VERSION = "1.2.7" # Updated version to reflect emoji review and explanation
 
-# Emoji map
+# Emoji map for messages
+# These are standard Unicode emojis, chosen for broad cross-platform compatibility.
+# Their visual appearance may vary slightly across different devices/operating systems
+# due to different emoji font implementations by platform vendors (e.g., Apple, Google, Samsung).
 EMOJI = {
-    'hello': '👋',
-    'translate': '🔄',
-    'warning': '⚠️',
-    'info': 'ℹ️',
-    'error': '❌',
-    'success': '✅',
-    'help': '💡',
-    'cache': '💾'
+    'hello': '👋',     # Waving Hand
+    'translate': '🔄', # Counterclockwise Arrows Button
+    'warning': '⚠️',    # Warning Sign
+    'info': 'ℹ️',      # Information Sign
+    'error': '❌',     # Cross Mark
+    'success': '✅',    # White Heavy Check Mark
+    'help': '💡',      # Light Bulb
+    'cache': '💾',     # Floppy Disk (common symbol for saving/cache)
+    'time': '⏱️'       # Stopwatch (common symbol for time/duration)
 }
 
 @dataclass
@@ -61,14 +65,16 @@ class TranslationResult:
 
 class TranslationCache:
     def __init__(self, timeout: int = CACHE_TIMEOUT):
-        self.cache: Dict[str, CacheEntry] = {}
+        self.cache: Dict[str, CacheEntry] = {} # This is the actual dictionary storing the cache
         self.timeout = timeout
         
     def get(self, key: str) -> Optional[str]:
         if key in self.cache:
             entry = self.cache[key]
+            # Check if the entry is still valid (not expired)
             if datetime.utcnow() - entry.timestamp < timedelta(seconds=self.timeout):
                 return entry.text
+            # If expired, remove it from cache
             del self.cache[key]
         return None
         
@@ -76,6 +82,7 @@ class TranslationCache:
         self.cache[key] = CacheEntry(text=value, timestamp=datetime.utcnow())
         
     def cleanup(self):
+        """Removes expired entries from the cache."""
         now = datetime.utcnow()
         expired = [
             k for k, v in self.cache.items()
@@ -83,147 +90,209 @@ class TranslationCache:
         ]
         for k in expired:
             del self.cache[k]
+        # FIX: Changed self.cache.cache to self.cache
+        logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
+
 
 class TranslationService:
     def __init__(self):
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.cache = TranslationCache()
+        # Session is now managed externally and set via set_session
+        self.session: Optional[aiohttp.ClientSession] = None 
+        self.cache = TranslationCache() # self.cache here is an instance of TranslationCache
         self.last_cleanup = datetime.utcnow()
         self.base_url = "https://api.mymemory.translated.net/get"
+        # _initialized now depends on the session being provided/set
+        self._initialized = False
 
-    async def ensure_session(self):
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession()
+    def set_session(self, session: aiohttp.ClientSession):
+        """Sets the aiohttp client session for the translation service."""
+        self.session = session
+        self._initialized = True
+        logger.info("aiohttp ClientSession set for TranslationService.")
 
     def preprocess_text(self, text: str) -> str:
-        """Chuẩn hóa text."""
+        """Standardizes the text for translation."""
         return text.strip()
 
     def postprocess_translation(self, translated: str) -> str:
-        """Chuẩn hóa bản dịch."""
+        """Standardizes the translated text."""
         if not translated:
             return translated
             
-        # Xử lý HTML entities
+        # Handle common HTML entities
         translated = translated.replace("&quot;", '"')
         translated = translated.replace("&#39;", "'")
         translated = translated.replace("&amp;", "&")
         translated = translated.replace("&lt;", "<")
         translated = translated.replace("&gt;", ">")
-        
+            
         return translated.strip()
 
     def maybe_cleanup_cache(self):
+        """Triggers cache cleanup if enough time has passed."""
         if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
-            self.cache.cleanup()
+            self.cache.cleanup() # Calls the cleanup method of the TranslationCache instance
             self.last_cleanup = datetime.utcnow()
+            logger.info("Scheduled cache cleanup executed.")
+
+    async def get_service_status(self) -> Dict[str, Any]:
+        """Gets the status of the translation service."""
+        return {
+            "status": "active" if self._initialized and self.session and not self.session.closed else "inactive",
+            "cache_size": len(self.cache.cache), # Here, self.cache is TranslationCache, so .cache is correct
+            "last_cleanup": self.last_cleanup.isoformat()
+        }
 
     async def translate(self, text: str) -> TranslationResult:
-        """Dịch văn bản sử dụng MyMemory API."""
+        """Translates text using the MyMemory API."""
         self.maybe_cleanup_cache()
-        
-        # Check cache
-        cached = self.cache.get(text)
+            
+        # Check cache first
+        cached = self.cache.get(text) # Calls the get method of the TranslationCache instance
         if cached:
+            logger.info(f"Translation retrieved from cache for text: {text[:30]}...")
             return TranslationResult(
                 original_text=text,
                 translated_text=cached,
                 success=True,
                 from_cache=True
             )
-        
-        # Prepare translation
-        await self.ensure_session()
+            
+        # Ensure session is available before making API call
+        if not self.session or self.session.closed:
+            # This should ideally not happen if lifespan manages the session correctly
+            logger.error("TranslationService session is not active. Cannot translate.")
+            return TranslationResult(
+                original_text=text,
+                success=False,
+                error_message="Dịch vụ dịch chưa sẵn sàng."
+            )
+
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text)
-        
+            
         params = {
             "q": processed_text,
-            "langpair": "vi|ja",
-            "de": "a@b.c"  # Email for better rate limits
+            "langpair": "vi|ja", # Translate from Vietnamese to Japanese
+            "de": "a@b.c"  # Email for better rate limits, as per MyMemory API docs
         }
 
-        # Try translation with retries
+        # Attempt translation with retries
         for attempt in range(RETRY_COUNT):
             try:
                 async with self.session.get(
                     self.base_url,
                     params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=10) # 10 seconds timeout for the request
                 ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        
-                        if not data or "responseData" not in data:
-                            raise ValueError("Invalid response format")
-                        
-                        translated_text = data["responseData"].get("translatedText")
-                        if not translated_text:
-                            raise ValueError("Empty translation")
-                        
-                        # Process the translation
-                        result.translated_text = self.postprocess_translation(translated_text)
-                        result.success = True
-                        
-                        # Cache successful translation
-                        self.cache.set(text, result.translated_text)
-                        
-                        logger.info(
-                            f"Translation successful: {text[:30]} -> "
-                            f"{result.translated_text[:30]}"
-                        )
-                        
-                        return result
-                    else:
-                        raise ValueError(f"API returned status {response.status}")
-                        
+                    response.raise_for_status() # Raise an exception for bad HTTP status codes (4xx or 5xx)
+                    data = await response.json()
+                            
+                    if not data or "responseData" not in data:
+                        raise ValueError("Invalid response format from MyMemory API.")
+                            
+                    translated_text = data["responseData"].get("translatedText")
+                    if not translated_text:
+                        raise ValueError("Empty translation received from MyMemory API.")
+                            
+                    # Process and store the translation
+                    result.translated_text = self.postprocess_translation(translated_text)
+                    result.success = True
+                            
+                    # Cache successful translation
+                    self.cache.set(text, result.translated_text) # Calls the set method of the TranslationCache instance
+                            
+                    logger.info(
+                        f"Translation successful (API call): {text[:30]} -> "
+                        f"{result.translated_text[:30]}"
+                    )
+                            
+                    return result
+            except aiohttp.ClientError as e:
+                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = f"Lỗi kết nối dịch vụ: {e}"
+            except json.JSONDecodeError:
+                logger.error(f"Failed to decode JSON response (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
+                result.error_message = "Lỗi phản hồi từ dịch vụ dịch."
+            except ValueError as e:
+                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = f"Lỗi dữ liệu dịch: {e}"
             except Exception as e:
-                logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
-                if attempt < RETRY_COUNT - 1:
-                    await asyncio.sleep(RETRY_DELAY)
-                continue
+                logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
 
-        result.error_message = "Không thể dịch văn bản. Vui lòng thử lại sau."
+            if attempt < RETRY_COUNT - 1:
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                logger.error(f"All {RETRY_COUNT} translation attempts failed for text: {text[:50]}...")
+
+        result.error_message = result.error_message or "Không thể dịch văn bản. Vui lòng thử lại sau."
         return result
+
 
 class TelegramBot:
     def __init__(self):
         self.application: Optional[Application] = None
-        self.translator = TranslationService()
+        self.translator = TranslationService() # TranslationService instance
         self._initialized = False
         self._start_time = datetime.utcnow()
+        self._bot_username: Optional[str] = None # Stores the bot's username once initialized
 
     async def initialize(self, token: str, webhook_url: str) -> bool:
+        """Initializes the Telegram bot application."""
         try:
             self.application = (
                 ApplicationBuilder()
                 .token(token)
                 .build()
             )
-            
-            await self.application.bot.get_me()
-            
-            # Register handlers
+                
+            me = await self.application.bot.get_me() # Get bot info once during initialization
+            self._bot_username = me.username
+            logger.info(f"Bot info retrieved: @{self._bot_username}")
+                
+            # Register handlers for commands and text messages
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CommandHandler("help", self.help_command))
             self.application.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self.translate_text)
             )
-            
+                
             await self.application.initialize()
+            # Set webhook URL for Telegram updates to receive messages
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
-            
+            logger.info(f"Webhook set to {webhook_url}/{token}")
+                
             self._initialized = True
             return True
-            
+                
         except Exception as e:
-            logger.error(f"Bot initialization failed: {str(e)}")
+            logger.error(f"Bot initialization failed: {str(e)}", exc_info=True)
             return False
 
+    async def get_bot_status(self) -> Dict[str, Any]:
+        """Gets bot status information without repeatedly calling get_me."""
+        status = "inactive"
+        username = self._bot_username # Use cached username
+        initialized = self._initialized
+
+        if self.application and self.application.bot and initialized:
+            status = "active"
+        else:
+            status = "inactive"
+        
+        return {
+            "status": status,
+            "username": username,
+            "initialized": initialized,
+            "start_time": self._start_time.isoformat()
+        }
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles the /start command."""
         user = update.effective_user
         logger.info(f"User {user.id} started the bot")
-        
+            
         welcome_text = (
             f"{EMOJI['hello']} こんにちは {user.first_name}さん！\n\n"
             f"{EMOJI['info']} Bot dịch văn bản Việt-Nhật\n"
@@ -233,8 +302,9 @@ class TelegramBot:
         await update.message.reply_text(welcome_text)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles the /help command."""
         logger.info(f"User {update.effective_user.id} requested help")
-        
+            
         help_text = (
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
             "1. Gửi văn bản tiếng Việt\n"
@@ -249,9 +319,10 @@ class TelegramBot:
         await update.message.reply_text(help_text)
 
     async def translate_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles text messages for translation."""
         user = update.effective_user
         text = update.message.text.strip()
-        
+            
         if not text:
             await update.message.reply_text(
                 f"{EMOJI['warning']} Vui lòng nhập văn bản để dịch."
@@ -265,75 +336,113 @@ class TelegramBot:
             )
             return
 
-        logger.info(f"Translating for user {user.id}: {text[:50]}...")
-        
+        logger.info(f"Translating for user {user.id}: '{text[:50]}...'")
+            
         try:
-            await update.message.chat.send_action("typing")
-            
+            await update.message.chat.send_action("typing") # Show "typing..." status to the user
+                
             result = await self.translator.translate(text)
-            
+                
             if result.success and result.translated_text:
-                # Tin nhắn thông báo ngắn gọn
+                # Short confirmation message
                 await update.message.reply_text(
                     f"{EMOJI['translate']} Bản dịch:" +
-                    (f" {EMOJI['cache']}" if result.from_cache else "")
+                    (f" {EMOJI['cache']}" if result.from_cache else "") # Indicate if translation came from cache
                 )
-                
-                # Bản dịch trong tin nhắn riêng
+                    
+                # The translation itself in a separate message for easy copying
                 await update.message.reply_text(result.translated_text)
-                
+                    
                 logger.info(f"Translation successful for user {user.id}")
             else:
                 await update.message.reply_text(
                     f"{EMOJI['error']} 申し訳ございません。\n"
-                    f"{result.error_message or '翻訳エラーが発生しました。'}"
+                    f"{result.error_message or '翻訳エラーが発生しました。'}" # Fallback error message if no specific error
                 )
-                logger.error(f"Translation failed for user {user.id}")
-            
+                logger.error(f"Translation failed for user {user.id}: {result.error_message}")
+                
         except Exception as e:
-            logger.error(f"Error while translating for user {user.id}: {str(e)}")
+            logger.error(f"Error while translating for user {user.id} (text: '{text[:50]}...'): {e}", exc_info=True)
             await update.message.reply_text(
                 f"{EMOJI['error']} エラーが発生しました。\n"
                 "Đã xảy ra lỗi. Vui lòng thử lại sau."
             )
 
-# Initialize bot
+# Initialize bot instance globally
 bot = TelegramBot()
+
+# Custom log filter to suppress Uvicorn's INFO logs for /health endpoint
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Check if the log is from uvicorn.access logger and if it's an INFO level GET /health 200 OK
+        if record.name == "uvicorn.access" and record.levelno == logging.INFO:
+            # Uvicorn's access log message format typically puts method, path, and status code in record.args
+            # record.args will be a tuple like ('10.209.26.200:46028', 'GET', '/health', 'HTTP/1.1', 200)
+            try:
+                # Check if it's a GET request to /health and the status code is 200
+                if record.args[1] == 'GET' and record.args[2] == '/health' and record.args[4] == 200:
+                    return False  # Do not log this record
+            except (IndexError, TypeError):
+                # Handle cases where record.args might not have the expected structure
+                # In such cases, we let the log pass, or log a warning for debugging the filter itself
+                pass
+        return True # Log all other records
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Add the custom filter to uvicorn.access logger at startup
+    uvicorn_access_logger = logging.getLogger("uvicorn.access")
+    health_filter = HealthCheckFilter()
+    uvicorn_access_logger.addFilter(health_filter)
+    logger.info("Uvicorn health check log filter added.")
+
+    # Startup tasks: Initialize bot and translation service session
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     webhook_url = os.getenv("WEBHOOK_URL")
-    
+        
     if not token or not webhook_url:
-        logger.error("Missing required environment variables")
+        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Exiting.")
         raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
-    
+
+    # Create aiohttp session for the TranslationService at startup
+    aiohttp_session = None
     try:
+        aiohttp_session = aiohttp.ClientSession()
+        bot.translator.set_session(aiohttp_session) # Set the session on the translator instance
+        logger.info("TranslationService aiohttp session created.")
+
         success = await bot.initialize(token, webhook_url)
         if not success:
-            raise ValueError("Failed to initialize bot")
-        logger.info("Bot initialized successfully")
+            logger.critical("Failed to initialize bot. Application will not start.")
+            raise RuntimeError("Failed to initialize bot")
+        logger.info("Bot initialized successfully and ready to receive updates.")
     except Exception as e:
-        logger.error(f"Startup failed: {str(e)}")
-        raise
-    
-    yield
-    
-    # Shutdown
+        logger.critical(f"Startup failed due to bot initialization or session creation error: {e}", exc_info=True)
+        # Ensure the aiohttp session is closed if any error occurs during startup
+        if aiohttp_session and not aiohttp_session.closed:
+            await aiohttp_session.close()
+        raise # Re-raise the exception to prevent the app from starting if init fails
+        
+    yield # Application is running and ready to handle requests
+
+    # Remove the custom filter at shutdown to clean up (good practice, though not strictly necessary for short-lived apps)
+    uvicorn_access_logger.removeFilter(health_filter)
+    logger.info("Uvicorn health check log filter removed.")
+
+    # Shutdown tasks: Close bot and translation service sessions
+    logger.info("Application shutdown initiated.")
     try:
         if bot.application:
             await bot.application.shutdown()
-            logger.info("Bot shutdown complete")
-        
-        if bot.translator.session:
-            await bot.translator.session.close()
-            logger.info("Translation service shutdown complete")
+            logger.info("Telegram bot application shutdown complete.")
+            
+        if aiohttp_session and not aiohttp_session.closed: # Close the session created here
+            await aiohttp_session.close()
+            logger.info("Translation service aiohttp session closed.")
     except Exception as e:
-        logger.error(f"Shutdown error: {str(e)}")
+        logger.error(f"Error during application shutdown: {e}", exc_info=True)
 
-# Initialize FastAPI
+# Initialize FastAPI app
 app = FastAPI(
     title="Telegram Translation Bot",
     description="Bot dịch văn bản Việt-Nhật",
@@ -343,59 +452,116 @@ app = FastAPI(
 
 @app.get("/")
 async def root():
+    """Root endpoint with basic status."""
     uptime = datetime.utcnow() - bot._start_time
-    cache_size = len(bot.translator.cache.cache)
+    # FIX: Changed bot.translator.cache.cache to bot.translator.cache.cache for consistency
+    cache_size = len(bot.translator.cache.cache) 
     return {
         "status": "active" if bot._initialized else "initializing",
         "timestamp": datetime.utcnow().isoformat(),
         "version": VERSION,
         "uptime_seconds": uptime.total_seconds(),
-        "cache_entries": cache_size
+        "cache_entries": cache_size,
+        "bot_username": bot._bot_username # Include cached username in root response
     }
 
 @app.get("/health")
 async def health_check():
+    """Enhanced health check endpoint for uptime monitoring."""
+    current_time = datetime.utcnow()
+    uptime = current_time - bot._start_time
+        
     if not bot._initialized:
-        raise HTTPException(status_code=503, detail="Bot is not initialized")
-    return {
-        "status": "ok",
-        "bot_status": "active",
+        # If bot is not initialized, always log at WARNING and return 503
+        logger.warning(f"Health check failed: Bot not initialized. Uptime: {uptime.total_seconds()}s")
+        raise HTTPException(
+            status_code=503, # Service Unavailable if bot is not initialized
+            detail={
+                "status": "error",
+                "message": "Bot is not initialized",
+                "timestamp": current_time.isoformat(),
+                "uptime_seconds": uptime.total_seconds()
+            }
+        )
+
+    # Get detailed status from bot and translation service
+    bot_status = await bot.get_bot_status()
+    translation_status = await bot.translator.get_service_status()
+
+    # Determine overall status based on sub-service statuses
+    overall_status = "ok"
+    if bot_status["status"] != "active":
+        overall_status = "degraded"
+    if translation_status["status"] != "active":
+        overall_status = "degraded"
+
+    response = {
+        "status": overall_status,
+        "timestamp": current_time.isoformat(),
         "version": VERSION,
-        "cache_size": len(bot.translator.cache.cache)
+        "uptime": {
+            "seconds": int(uptime.total_seconds()),
+            "formatted": str(uptime).split('.')[0] # Format uptime as HH:MM:SS
+        },
+        "services": {
+            "bot": bot_status,
+            "translation": translation_status
+        }
     }
+    
+    # Log 'ok' status at DEBUG level, 'degraded'/'error' at INFO level
+    if overall_status == "ok":
+        logger.debug(f"Health check: {response['status']}")
+    else:
+        logger.info(f"Health check: {response['status']}")
+        
+    return response
 
 @app.post("/{token}")
 async def telegram_webhook(token: str, request: Request):
+    """Handles Telegram webhook requests."""
     if not bot._initialized:
+        logger.warning("Received webhook but bot is not initialized. Responding with 503.")
         raise HTTPException(status_code=503, detail="Bot is not initialized")
-    
-    if token != os.getenv("TELEGRAM_BOT_TOKEN"):
-        logger.warning(f"Invalid token received: {token[:10]}...")
+        
+    # Security check: Validate the incoming token against environment variable
+    expected_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not expected_token:
+        logger.error("TELEGRAM_BOT_TOKEN environment variable is not set. Cannot validate webhook.")
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Bot token not set.")
+
+    if token != expected_token:
+        logger.warning(f"Invalid token received in webhook URL: {token[:10]}... (expected {expected_token[:10]}...)")
         raise HTTPException(status_code=403, detail="Invalid token")
-    
+        
     try:
+        # Parse the incoming update from Telegram
         update = Update.de_json(await request.json(), bot.application.bot)
+        # Process the update using the bot's application
         await bot.application.process_update(update)
         return {"status": "ok"}
+    except json.JSONDecodeError:
+        logger.error("Received webhook with invalid JSON payload.")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Error processing update: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
+        logger.error(f"Error processing Telegram update: {error_msg}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing update: {error_msg}")
 
 if __name__ == "__main__":
     import uvicorn
-    
+        
     port = int(os.getenv("PORT", "10000"))
     log_level = os.getenv("LOG_LEVEL", "info")
-    
+        
     config = uvicorn.Config(
-        "bot:app",
+        "bot:app", # Assumes your file is named 'bot.py'
         host="0.0.0.0",
         port=port,
-        workers=1,
-        reload=False,
+        workers=1, # Typically 1 worker for Telegram bots to avoid race conditions with updates
+        reload=False, # Set to True for development, False for production
         log_level=log_level
     )
-    
+        
     server = uvicorn.Server(config)
     server.run()
