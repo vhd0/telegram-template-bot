@@ -313,11 +313,7 @@ class TranslationService:
                 logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = f"Lỗi kết nối dịch vụ: {e}"
             except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON response (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
-                result.error_message = "Lỗi phản hồi từ dịch vụ dịch."
-            except ValueError as e:
-                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi dữ liệu dịch: {e}"
+                logger.error(f"Failed to decode JSON response during language detection (attempt {attempt + 1}/{RETRY_COUNT}).")
             except Exception as e:
                 logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
                 result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
@@ -594,7 +590,7 @@ async def lifespan(app: FastAPI):
     """
     # Add the custom filter to uvicorn.access logger at startup
     uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    health_filter = HealthCheckFilter()
+    health_filter = Health-CheckFilter()
     uvicorn_access_logger.addFilter(health_filter)
     logger.info("Uvicorn health check log filter added.")
 
@@ -602,6 +598,11 @@ async def lifespan(app: FastAPI):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     webhook_url = os.getenv("WEBHOOK_URL")
     google_api_key = os.getenv("GOOGLE_TRANSLATE_API_KEY") # New: Get Google API Key from environment
+
+    # Log the values of environment variables for debugging
+    logger.info(f"Environment variable TELEGRAM_BOT_TOKEN: {'***' + token[-4:] if token else 'None'}")
+    logger.info(f"Environment variable WEBHOOK_URL: {webhook_url or 'None'}")
+    logger.info(f"Environment variable GOOGLE_TRANSLATE_API_KEY: {'***' + google_api_key[-4:] if google_api_key else 'None'}")
 
     if not token or not webhook_url or not google_api_key:
         logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN, WEBHOOK_URL, or GOOGLE_TRANSLATE_API_KEY. Exiting.")
