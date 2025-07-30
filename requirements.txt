@@ -1,5 +1,5 @@
 fastapi==0.110.1
 uvicorn==0.30.1
 python-telegram-bot==20.8
-deep-translator==1.14.0
+deep-translator==1.11.4
 langdetect==1.0.9
