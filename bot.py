@@ -1,95 +1,63 @@
-import os
-from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
-from telegram.ext import Dispatcher, CommandHandler, CallbackQueryHandler, MessageHandler, filters
-from deep_translator import GoogleTranslator
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes
+)
 from langdetect import detect
+from deep_translator import GoogleTranslator
 
-app = FastAPI()
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot=bot, update_queue=None, use_context=True)
-
-# Các lựa chọn ngôn ngữ đầu ra
-LANG_CHOICES = {
+LANGUAGES = {
     "vi": "Tiếng Việt",
     "ja": "Tiếng Nhật",
 }
 
-def start(update, context):
-    update.message.reply_text(
-        "Chào bạn! Gửi cho tôi bất kỳ văn bản nào, tôi sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Chào bạn! Gửi một đoạn văn, mình sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật."
     )
 
-def translate_text(text, dest_lang):
-    try:
-        # Dùng deep-translator với GoogleTranslator
-        translated = GoogleTranslator(source='auto', target=dest_lang).translate(text)
-        return translated
-    except Exception as e:
-        return f"Lỗi khi dịch: {str(e)}"
-
-def handle_message(update, context):
+async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    try:
-        detected_lang = detect(text)
-    except Exception:
-        detected_lang = "unknown"
+    detected_lang = detect(text)
 
     keyboard = [
         [
-            InlineKeyboardButton(f"Dịch sang {name}", callback_data=f"translate_{dest}")
-            for dest, name in LANG_CHOICES.items()
+            InlineKeyboardButton(LANGUAGES[lang_code], callback_data=f"{lang_code}|{text}")
+            for lang_code in LANGUAGES
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    update.message.reply_text(
-        f"Phát hiện ngôn ngữ: {detected_lang}\nBạn muốn dịch sang ngôn ngữ nào?",
+    await update.message.reply_text(
+        f"Phát hiện ngôn ngữ: {detected_lang}. Bạn muốn dịch sang ngôn ngữ nào?",
         reply_markup=reply_markup
     )
 
-    # Lưu text gốc vào context.user_data để callback có thể dùng
-    context.user_data["last_text"] = text
-    context.user_data["detected_lang"] = detected_lang
-
-def button_handler(update, context):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    query.answer()
+    await query.answer()
+
     data = query.data
+    target_lang, original_text = data.split("|", 1)
 
-    if data.startswith("translate_"):
-        dest_lang = data.replace("translate_", "")
-        original_text = context.user_data.get("last_text", "")
-        detected_lang = context.user_data.get("detected_lang", "unknown")
+    try:
+        translated = GoogleTranslator(source='auto', target=target_lang).translate(original_text)
+    except Exception as e:
+        translated = f"Lỗi dịch: {str(e)}"
 
-        if not original_text:
-            query.edit_message_text("Không tìm thấy văn bản để dịch.")
-            return
+    await query.edit_message_text(f"**Bản dịch ({LANGUAGES[target_lang]}):**\n{translated}", parse_mode="Markdown")
 
-        if detected_lang == dest_lang:
-            query.edit_message_text(f"Văn bản đã là ngôn ngữ {LANG_CHOICES.get(dest_lang)} rồi!")
-            return
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-        translated_text = translate_text(original_text, dest_lang)
-        query.edit_message_text(
-            f"Ngôn ngữ gốc: {detected_lang}\nDịch sang {LANG_CHOICES.get(dest_lang)}:\n\n{translated_text}"
-        )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_text))
+    app.add_handler(CallbackQueryHandler(button))
 
-# Đăng ký handler
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-dp.add_handler(CallbackQueryHandler(button_handler))
+    print("Bot đang chạy...")
+    app.run_polling()
 
-@app.post(f"/{TOKEN}")
-async def telegram_webhook(req: Request):
-    update = Update.de_json(await req.json(), bot)
-    dp.process_update(update)
-    return {"ok": True}
-
-@app.on_event("startup")
-async def on_startup():
-    await bot.set_webhook(WEBHOOK_URL + "/" + TOKEN)
+if __name__ == "__main__":
+    main()
