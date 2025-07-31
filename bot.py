@@ -45,7 +45,7 @@ EMOJI = {
     'info': 'ℹ️',
     'error': '❌',
     'success': '✅',
-    'help': '💡',
+    'help': '�',
     'cache': '💾',
     'time': '⏱️',
     'detect': '🔍' # Magnifying Glass Tilted Left
@@ -130,8 +130,8 @@ class TranslationService:
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
-        # Updated API endpoint for your Hugging Face Space
-        self.hf_api_url = "https://arsenaler14-hfapi.hf.space/run/predict"
+        # Updated API endpoint for your Hugging Face Model Inference API
+        self.hf_api_url = "https://api-inference.huggingface.co/models/arsenaler14/hfapi"
         self.lang_detect_service = LangDetectService() # Initialize LangDetectService
         self._initialized = False
 
@@ -144,6 +144,7 @@ class TranslationService:
             "ja": "jpn_Jpan",
             "en": "eng_Latn",
             # Add other mappings if your bot will support more languages
+            # Ensure these match the NLLB model's supported languages
         }
         return mapping.get(lang_code)
 
@@ -155,12 +156,10 @@ class TranslationService:
 
     def preprocess_text(self, text: str) -> str:
         """Standardizes the text for translation."""
-        # NLLB model typically handles this well, but keeping for consistency if needed.
         return text.strip()
 
     def postprocess_translation(self, translated: str) -> str:
         """Standardizes the translated text by handling common HTML entities."""
-        # NLLB model's output is usually clean, but keeping for consistency if needed.
         if not translated:
             return translated
         translated = translated.replace("&quot;", '"')
@@ -241,58 +240,43 @@ class TranslationService:
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text, source_lang=source_lang, target_lang=target_lang)
             
-        # Data payload for Hugging Face Inference API
-        # The Gradio app expects a list of inputs in the 'data' key.
-        # Our Gradio app's `translate_text` function only takes one argument: the text to translate.
+        # Get HF_TOKEN from environment variable
+        hf_token = os.getenv("HF_TOKEN")
+        headers = {}
+        if hf_token:
+            headers["Authorization"] = f"Bearer {hf_token}"
+        else:
+            logger.warning("HF_TOKEN environment variable not set. API calls might be rate-limited or fail.")
+            # Depending on your deployment, you might want to raise an error here
+            # if HF_TOKEN is strictly required for your model usage.
+
+        # Data payload for Hugging Face Inference API for translation models
         data = {
-            "data": [processed_text]
+            "inputs": processed_text,
+            "parameters": {
+                "src_lang": nllb_source_lang,
+                "tgt_lang": nllb_target_lang
+            }
         }
         
-        # Hugging Face NLLB API doesn't directly take source/target lang in payload
-        # The Gradio app handles src_lang and target_lang internally based on its config.
-        # We assume the Gradio app is configured for vie_Latn to eng_Latn.
-        # If we need dynamic language selection, the Gradio app needs to be updated.
-        # For now, we rely on the pre-configured Gradio app.
-        # The bot's logic will only allow vi->ja or ja->vi, which the Gradio app needs to support.
-        # IMPORTANT: The current Gradio app (app.py) is hardcoded for vie_Latn -> eng_Latn.
-        # For this bot to work correctly with vi<->ja, the Gradio app MUST be updated
-        # to accept source and target languages as inputs, or to dynamically set them.
-        # For this example, I'll assume the Gradio app is *already* configured to handle
-        # the specific vi<->ja pair, or that this bot is now only for vi->en.
-        # Given the bot's current logic (vi/ja buttons), the Gradio app needs to be more flexible.
-        # Let's assume for now that the Gradio app on HF is configured to handle the specific
-        # source_lang and target_lang *implicitly* or that we're only translating between
-        # the two languages it supports.
-        # A more robust solution would involve passing source/target lang to the Gradio API
-        # if the Gradio app was designed to accept them.
-        # For the purpose of replacing the API, we'll proceed assuming the HF Space
-        # handles the language pair specified by the bot's logic (vi<->ja).
-        # However, the provided app.py is fixed to vie_Latn -> eng_Latn.
-        # This is a critical mismatch. I will proceed by assuming the HF Space
-        # will be updated to handle dynamic language pairs, or that the bot's
-        # language pair choices need to match the HF Space's fixed pair.
-        # Given the bot's current setup (vi/ja buttons), I will make a critical assumption:
-        # The HF Space's Gradio app *must* be capable of translating between the requested
-        # source_lang and target_lang (e.g., vie_Latn <-> jpn_Jpan).
-        # If it's not, the translation will fail or be incorrect.
-        # I will add a note in the conclusion about this.
-
         for attempt in range(RETRY_COUNT):
             try:
                 async with self.session.post(
                     self.hf_api_url,
                     json=data, # Send data as JSON body
+                    headers=headers, # Add headers for authentication
                     timeout=aiohttp.ClientTimeout(total=30) # Increased timeout for model inference
                 ) as response:
                     response.raise_for_status()
                     api_response = await response.json()
                                 
-                    if not api_response or "data" not in api_response or not isinstance(api_response["data"], list):
-                        raise ValueError("Invalid response format from Hugging Face API: 'data' key missing or not a list.")
+                    # Expected response for NLLB Inference API is a list of dicts, e.g., [{"translation_text": "..."}]
+                    if not api_response or not isinstance(api_response, list) or not api_response[0].get("translation_text"):
+                        raise ValueError("Invalid response format from Hugging Face Inference API: 'translation_text' key missing or not a list of dicts.")
                                 
-                    translated_text = api_response["data"][0] # Get the first element from the 'data' list
+                    translated_text = api_response[0]["translation_text"] # Get the translated text
                     if not translated_text:
-                        raise ValueError("Empty translation received from Hugging Face API.")
+                        raise ValueError("Empty translation received from Hugging Face Inference API.")
                                 
                     result.translated_text = self.postprocess_translation(translated_text)
                     result.success = True
@@ -573,14 +557,16 @@ async def lifespan(app: FastAPI):
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     webhook_url = os.getenv("WEBHOOK_URL")
+    hf_token = os.getenv("HF_TOKEN") # Retrieve HF_TOKEN
 
     # Log the values of environment variables for debugging
     logger.info(f"Environment variable TELEGRAM_BOT_TOKEN: {'***' + token[-4:] if token else 'None'}")
     logger.info(f"Environment variable WEBHOOK_URL: {webhook_url or 'None'}")
+    logger.info(f"Environment variable HF_TOKEN: {'***' + hf_token[-4:] if hf_token else 'None'}") # Log HF_TOKEN
 
-    if not token or not webhook_url:
-        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Exiting.")
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
+    if not token or not webhook_url or not hf_token: # Ensure HF_TOKEN is present
+        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN, WEBHOOK_URL, or HF_TOKEN. Exiting.")
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN, WEBHOOK_URL, or HF_TOKEN")
 
     global bot
     bot = TelegramBot()
@@ -743,3 +729,4 @@ if __name__ == "__main__":
     server = uvicorn.Server(config)
     server.run()
 
+�
