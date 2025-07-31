@@ -163,7 +163,8 @@ async def run_bot():
 
     # Khởi tạo aiohttp web application
     aio_app = web.Application()
-    aio_app.router.add_get('/', health_check_handler) # Health check endpoint
+    aio_app.router.add_get('/', health_check_handler) # Health check endpoint cho đường dẫn gốc
+    aio_app.router.add_get('/health', health_check_handler) # Thêm health check endpoint cho /health
     aio_app.router.add_post(f'/{webhook_path}', telegram_webhook_handler) # Telegram webhook endpoint
 
     # Khởi chạy aiohttp web server
