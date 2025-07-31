@@ -1,4 +1,5 @@
-python-telegram-bot[webhooks]
+python-telegram-bot>=20.0
+fastapi>=0.68.0
+uvicorn>=0.15.0
+aiohttp>=3.8.0
 langdetect
-deep-translator
-aiohttp
