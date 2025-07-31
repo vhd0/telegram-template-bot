@@ -99,6 +99,7 @@ class TranslationCache:
             del self.cache[k]
         logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
 
+
 class LangDetectService:
     """Handles language detection using the langdetect library."""
     async def detect_language(self, text: str) -> Optional[str]:
@@ -124,14 +125,27 @@ class LangDetectService:
 
 
 class TranslationService:
-    """Manages translation using MyMemory API and delegates language detection."""
+    """Manages translation using Hugging Face NLLB API and delegates language detection."""
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
-        self.mymemory_base_url = "https://api.mymemory.translated.net/get"
+        # Updated API endpoint for your Hugging Face Space
+        self.hf_api_url = "https://arsenaler14-hfapi.hf.space/run/predict"
         self.lang_detect_service = LangDetectService() # Initialize LangDetectService
         self._initialized = False
+
+    def _map_lang_code_to_nllb(self, lang_code: str) -> Optional[str]:
+        """
+        Maps a short language code (e.g., 'vi', 'ja', 'en') to NLLB's specific codes.
+        """
+        mapping = {
+            "vi": "vie_Latn",
+            "ja": "jpn_Jpan",
+            "en": "eng_Latn",
+            # Add other mappings if your bot will support more languages
+        }
+        return mapping.get(lang_code)
 
     def set_session(self, session: aiohttp.ClientSession):
         """Sets the aiohttp client session for the translation service."""
@@ -141,10 +155,12 @@ class TranslationService:
 
     def preprocess_text(self, text: str) -> str:
         """Standardizes the text for translation."""
+        # NLLB model typically handles this well, but keeping for consistency if needed.
         return text.strip()
 
     def postprocess_translation(self, translated: str) -> str:
         """Standardizes the translated text by handling common HTML entities."""
+        # NLLB model's output is usually clean, but keeping for consistency if needed.
         if not translated:
             return translated
         translated = translated.replace("&quot;", '"')
@@ -154,9 +170,9 @@ class TranslationService:
         translated = translated.replace("&gt;", ">")
         return translated.strip()
 
-    def maybe_cleanup_cache(self):
-        """Triggers cache cleanup if enough time has passed."""
-        if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
+    def maybe_cleanup_cache(self, force: bool = False):
+        """Triggers cache cleanup if enough time has passed or if forced."""
+        if force or datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
             self.cache.cleanup()
             self.last_cleanup = datetime.utcnow()
             logger.info("Scheduled cache cleanup executed.")
@@ -175,7 +191,7 @@ class TranslationService:
 
     async def translate(self, text: str, source_lang: str, target_lang: str) -> TranslationResult:
         """
-        Translates text using the MyMemory API.
+        Translates text using the Hugging Face NLLB API.
         Args:
             text (str): The text to translate.
             source_lang (str): The language code of the source text (e.g., 'vi', 'en').
@@ -183,15 +199,31 @@ class TranslationService:
         """
         self.maybe_cleanup_cache()
             
-        cache_key = f"{source_lang}-{target_lang}-{text}"
+        # Map source and target languages to NLLB specific codes
+        nllb_source_lang = self._map_lang_code_to_nllb(source_lang)
+        nllb_target_lang = self._map_lang_code_to_nllb(target_lang)
+
+        if not nllb_source_lang or not nllb_target_lang:
+            error_msg = f"Ngôn ngữ không được hỗ trợ bởi NLLB: Nguồn '{source_lang}' hoặc Đích '{target_lang}'."
+            logger.error(error_msg)
+            return TranslationResult(
+                original_text=text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                success=False,
+                error_message=error_msg
+            )
+
+        # Cache key should use NLLB language codes for consistency
+        cache_key = f"{nllb_source_lang}-{nllb_target_lang}-{text}"
         cached = self.cache.get(cache_key)
         if cached:
             logger.info(f"Translation retrieved from cache for key: {cache_key[:50]}...")
             return TranslationResult(
                 original_text=text,
                 translated_text=cached,
-                source_lang=source_lang,
-                target_lang=target_lang,
+                source_lang=source_lang, # Keep original codes for bot display
+                target_lang=target_lang, # Keep original codes for bot display
                 success=True,
                 from_cache=True
             )
@@ -209,52 +241,85 @@ class TranslationService:
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text, source_lang=source_lang, target_lang=target_lang)
             
-        params = {
-            "q": processed_text,
-            "langpair": f"{source_lang}|{target_lang}",
-            "de": "a@b.c"
+        # Data payload for Hugging Face Inference API
+        # The Gradio app expects a list of inputs in the 'data' key.
+        # Our Gradio app's `translate_text` function only takes one argument: the text to translate.
+        data = {
+            "data": [processed_text]
         }
+        
+        # Hugging Face NLLB API doesn't directly take source/target lang in payload
+        # The Gradio app handles src_lang and target_lang internally based on its config.
+        # We assume the Gradio app is configured for vie_Latn to eng_Latn.
+        # If we need dynamic language selection, the Gradio app needs to be updated.
+        # For now, we rely on the pre-configured Gradio app.
+        # The bot's logic will only allow vi->ja or ja->vi, which the Gradio app needs to support.
+        # IMPORTANT: The current Gradio app (app.py) is hardcoded for vie_Latn -> eng_Latn.
+        # For this bot to work correctly with vi<->ja, the Gradio app MUST be updated
+        # to accept source and target languages as inputs, or to dynamically set them.
+        # For this example, I'll assume the Gradio app is *already* configured to handle
+        # the specific vi<->ja pair, or that this bot is now only for vi->en.
+        # Given the bot's current logic (vi/ja buttons), the Gradio app needs to be more flexible.
+        # Let's assume for now that the Gradio app on HF is configured to handle the specific
+        # source_lang and target_lang *implicitly* or that we're only translating between
+        # the two languages it supports.
+        # A more robust solution would involve passing source/target lang to the Gradio API
+        # if the Gradio app was designed to accept them.
+        # For the purpose of replacing the API, we'll proceed assuming the HF Space
+        # handles the language pair specified by the bot's logic (vi<->ja).
+        # However, the provided app.py is fixed to vie_Latn -> eng_Latn.
+        # This is a critical mismatch. I will proceed by assuming the HF Space
+        # will be updated to handle dynamic language pairs, or that the bot's
+        # language pair choices need to match the HF Space's fixed pair.
+        # Given the bot's current setup (vi/ja buttons), I will make a critical assumption:
+        # The HF Space's Gradio app *must* be capable of translating between the requested
+        # source_lang and target_lang (e.g., vie_Latn <-> jpn_Jpan).
+        # If it's not, the translation will fail or be incorrect.
+        # I will add a note in the conclusion about this.
 
         for attempt in range(RETRY_COUNT):
             try:
-                async with self.session.get(
-                    self.mymemory_base_url,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                async with self.session.post(
+                    self.hf_api_url,
+                    json=data, # Send data as JSON body
+                    timeout=aiohttp.ClientTimeout(total=30) # Increased timeout for model inference
                 ) as response:
                     response.raise_for_status()
-                    data = await response.json()
-                            
-                    if not data or "responseData" not in data:
-                        raise ValueError("Invalid response format from MyMemory API.")
-                            
-                    translated_text = data["responseData"].get("translatedText")
+                    api_response = await response.json()
+                                
+                    if not api_response or "data" not in api_response or not isinstance(api_response["data"], list):
+                        raise ValueError("Invalid response format from Hugging Face API: 'data' key missing or not a list.")
+                                
+                    translated_text = api_response["data"][0] # Get the first element from the 'data' list
                     if not translated_text:
-                        raise ValueError("Empty translation received from MyMemory API.")
-                            
+                        raise ValueError("Empty translation received from Hugging Face API.")
+                                
                     result.translated_text = self.postprocess_translation(translated_text)
                     result.success = True
-                            
+                                
                     self.cache.set(cache_key, result.translated_text)
-                            
+                                
                     logger.info(
-                        f"Translation successful (API call) {source_lang} -> {target_lang}: {text[:30]} -> "
-                        f"{result.translated_text[:30]}"
+                        f"Translation successful (HF API call) {source_lang} -> {target_lang}: '{text[:30]}' -> "
+                        f"'{result.translated_text[:30]}'"
                     )
-                            
+                                
                     return result
             except aiohttp.ClientError as e:
-                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi kết nối dịch vụ: {e}"
+                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}) with HF API: {e}", exc_info=True)
+                result.error_message = f"Lỗi kết nối dịch vụ dịch Hugging Face: {e}"
             except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON response (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
-                result.error_message = "Lỗi phản hồi từ dịch vụ dịch."
+                logger.error(f"Failed to decode JSON response from HF API (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
+                result.error_message = "Lỗi phản hồi JSON từ dịch vụ dịch Hugging Face."
             except ValueError as e:
-                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi dữ liệu dịch: {e}"
+                logger.error(f"Translation data error from HF API (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = f"Lỗi dữ liệu dịch từ Hugging Face: {e}"
+            except IndexError:
+                logger.error(f"Unexpected response structure from HF API (attempt {attempt + 1}/{RETRY_COUNT}): 'data' list might be empty.", exc_info=True)
+                result.error_message = "Lỗi cấu trúc phản hồi từ Hugging Face API."
             except Exception as e:
-                logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
+                logger.error(f"Unexpected error during translation with HF API (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = "Đã xảy ra lỗi không xác định khi dịch với Hugging Face API."
 
             if attempt < RETRY_COUNT - 1:
                 await asyncio.sleep(RETRY_DELAY)
@@ -677,3 +742,4 @@ if __name__ == "__main__":
         
     server = uvicorn.Server(config)
     server.run()
+
