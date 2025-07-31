@@ -7,6 +7,8 @@ from telegram.ext import (
 )
 from langdetect import detect, DetectorFactory
 from deep_translator import GoogleTranslator
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 # Cấu hình logging để xem các thông báo từ bot
 logging.basicConfig(
@@ -19,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Đảm bảo bạn đã đặt các biến này trong cấu hình môi trường của Render.
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") # URL công khai của dịch vụ Render của bạn
-PORT = int(os.getenv("PORT", "8000")) # Render sẽ cung cấp cổng này, mặc định là 8000
+PORT = int(os.getenv("PORT", "10000")) # Render sẽ cung cấp cổng này, mặc định là 8000
 
 # Ngôn ngữ được hỗ trợ cho các nút inline
 LANGUAGES = {
@@ -29,6 +31,22 @@ LANGUAGES = {
 
 # Đặt seed cho langdetect để đảm bảo kết quả nhất quán (tùy chọn)
 DetectorFactory.seed = 0
+
+# Handler cho health check
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """
+    Một HTTP handler đơn giản để phản hồi các yêu cầu kiểm tra sức khỏe (health check)
+    từ Render hoặc các dịch vụ khác.
+    """
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -101,6 +119,16 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+def run_health_check_server():
+    """
+    Chạy một máy chủ HTTP nhỏ trên cùng cổng để xử lý health check.
+    """
+    server_address = ('0.0.0.0', PORT)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    logger.info(f"Health check server running on port {PORT}")
+    httpd.serve_forever()
+
+
 def main():
     """
     Hàm chính để khởi tạo và chạy bot.
@@ -110,6 +138,11 @@ def main():
         logger.error("TELEGRAM_BOT_TOKEN hoặc WEBHOOK_URL chưa được đặt trong biến môi trường.")
         print("Lỗi: Vui lòng đặt TELEGRAM_BOT_TOKEN và WEBHOOK_URL trong các biến môi trường.")
         return
+
+    # Khởi chạy máy chủ health check trong một luồng riêng
+    health_check_thread = threading.Thread(target=run_health_check_server)
+    health_check_thread.daemon = True # Đặt luồng là daemon để nó tự động kết thúc khi chương trình chính kết thúc
+    health_check_thread.start()
 
     # Xây dựng ứng dụng bot với token của bạn
     app = ApplicationBuilder().token(TOKEN).build()
