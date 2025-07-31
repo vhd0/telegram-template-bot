@@ -45,7 +45,7 @@ EMOJI = {
     'info': 'ℹ️',
     'error': '❌',
     'success': '✅',
-    'help': '�',
+    'help': '💡',
     'cache': '💾',
     'time': '⏱️',
     'detect': '🔍' # Magnifying Glass Tilted Left
@@ -729,4 +729,3 @@ if __name__ == "__main__":
     server = uvicorn.Server(config)
     server.run()
 
-�
