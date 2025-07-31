@@ -11,12 +11,17 @@ from telegram.error import BadRequest
 from langdetect import detect, DetectorFactory
 from aiohttp import web # Import aiohttp web framework
 
-# Cấu hình logging để xem các thông báo từ bot
+# Cấu hình logging chung cho bot
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO # Giữ cấp độ INFO cho các log quan trọng của bot
 )
 logger = logging.getLogger(__name__)
+
+# Tinh chỉnh cấp độ log cho aiohttp.access để ẩn các log ping healthcheck
+# Đặt cấp độ là WARNING hoặc ERROR để chỉ hiển thị các vấn đề nghiêm trọng
+logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
+
 
 # Lấy các biến môi trường. Điều này rất quan trọng khi triển khai trên Render.
 # Đảm bảo bạn đã đặt các biến này trong cấu hình môi trường của Render.
@@ -44,7 +49,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Xử lý lệnh /start. Gửi tin nhắn chào mừng và hướng dẫn sử dụng bot.
     """
     await update.message.reply_text(
-        "Chào bạn! Mình là bot dịch tự động. Hãy gửi một đoạn văn bất kỳ, mình sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật. Thật tiện lợi phải không nào!"
+        "👋 Chào bạn! Mình là bot dịch tự động. Hãy gửi một đoạn văn bất kỳ, mình sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật. Thật tiện lợi phải không nào! ✨"
     )
 
 async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60,23 +65,32 @@ async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         # Xử lý trường hợp không thể phát hiện ngôn ngữ (ví dụ: văn bản quá ngắn hoặc không rõ ràng)
         await update.message.reply_text(
-            "Xin lỗi, mình không thể phát hiện ngôn ngữ của đoạn văn này. Vui lòng thử lại với một đoạn văn dài hơn hoặc rõ ràng hơn nhé."
+            "⚠️ Xin lỗi, mình không thể phát hiện ngôn ngữ của đoạn văn này. Vui lòng thử lại với một đoạn văn dài hơn hoặc rõ ràng hơn nhé."
         )
         logger.error(f"Error detecting language: {e} for text: {text}")
         return
 
+    # Lưu trữ văn bản gốc và ngôn ngữ đã phát hiện vào user_data của context
+    # Sử dụng message_id làm khóa để truy xuất sau này
+    message_id = update.message.message_id
+    context.user_data[message_id] = {
+        "original_text": text,
+        "detected_lang": detected_lang
+    }
+    logger.info(f"Stored text for message_id {message_id} in user_data.")
+
     # Tạo bàn phím inline với các tùy chọn ngôn ngữ đích
     keyboard = [
         [
-            # Truyền cả ngôn ngữ đã phát hiện vào callback_data
-            InlineKeyboardButton(LANGUAGES[lang_code], callback_data=f"{lang_code}|{detected_lang}|{text}")
+            # Chỉ truyền ngôn ngữ đích và message_id vào callback_data
+            InlineKeyboardButton(LANGUAGES[lang_code], callback_data=f"{lang_code}|{message_id}")
             for lang_code in LANGUAGES
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"Mình phát hiện ngôn ngữ là: **{detected_lang.upper()}**. Bạn muốn dịch sang ngôn ngữ nào?",
+        f"🔍 Mình phát hiện ngôn ngữ là: **{detected_lang.upper()}**. Bạn muốn dịch sang ngôn ngữ nào? 👇",
         reply_markup=reply_markup,
         parse_mode="Markdown" # Sử dụng Markdown để in đậm ngôn ngữ phát hiện
     )
@@ -87,11 +101,25 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Thực hiện dịch văn bản bằng Lingva API và gửi kết quả.
     """
     query = update.callback_query
-    await query.answer("Đang dịch...") # Phải gọi query.answer() để bỏ trạng thái "đang tải" trên nút và hiển thị thông báo ngắn
+    await query.answer("Đang dịch... ⏳") # Phải gọi query.answer() để bỏ trạng thái "đang tải" trên nút và hiển thị thông báo ngắn
 
     data = query.data
-    # Tách ngôn ngữ đích, ngôn ngữ gốc đã phát hiện và văn bản gốc
-    target_lang, detected_lang, original_text = data.split("|", 2) 
+    # Tách ngôn ngữ đích và message_id từ callback_data
+    target_lang, message_id_str = data.split("|", 1) 
+    message_id = int(message_id_str)
+
+    # Lấy văn bản gốc và ngôn ngữ đã phát hiện từ user_data
+    translation_data = context.user_data.get(message_id)
+
+    if not translation_data:
+        await query.edit_message_text(
+            "❌ Rất tiếc, không tìm thấy văn bản gốc để dịch. Vui lòng gửi lại tin nhắn mới nhé."
+        )
+        logger.warning(f"No translation data found for message_id: {message_id}")
+        return
+
+    original_text = translation_data["original_text"]
+    detected_lang = translation_data["detected_lang"]
 
     translated_text = ""
     try:
@@ -133,21 +161,27 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Chỉnh sửa tin nhắn gốc để hiển thị bản dịch
     try:
         await query.edit_message_text(
-            f"**Bản dịch ({LANGUAGES[target_lang]}):**\n{translated_text}",
+            f"✅ **Bản dịch ({LANGUAGES[target_lang]}):**\n{translated_text}",
             parse_mode="Markdown"
         )
     except BadRequest as e:
         # Xử lý lỗi BadRequest từ Telegram (ví dụ: nội dung bị chặn)
         logger.error(f"BadRequest error when sending message: {e}")
         await query.edit_message_text(
-            "Xin lỗi, mình không thể gửi bản dịch này. Có thể nội dung vi phạm chính sách của Telegram hoặc có vấn đề về định dạng."
+            "🚫 Xin lỗi, mình không thể gửi bản dịch này. Có thể nội dung vi phạm chính sách của Telegram hoặc có vấn đề về định dạng."
         )
     except Exception as e:
         # Xử lý các lỗi khác khi gửi tin nhắn
         logger.error(f"Unexpected error when sending message: {e}")
         await query.edit_message_text(
-            "Đã xảy ra lỗi không mong muốn khi gửi bản dịch. Vui lòng thử lại."
+            "💥 Đã xảy ra lỗi không mong muốn khi gửi bản dịch. Vui lòng thử lại."
         )
+    finally:
+        # Xóa dữ liệu đã sử dụng khỏi user_data để giải phóng bộ nhớ
+        if message_id in context.user_data:
+            del context.user_data[message_id]
+            logger.info(f"Cleaned up user_data for message_id: {message_id}")
+
 
 # --- aiohttp Web Server Handlers ---
 
