@@ -1,3 +1,5 @@
+import os
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -6,8 +8,18 @@ from telegram.ext import (
 from langdetect import detect, DetectorFactory
 from deep_translator import GoogleTranslator
 
-# Đặt token bot Telegram của bạn vào đây
-TOKEN = "TELEGRAM_BOT_TOKEN"
+# Cấu hình logging để xem các thông báo từ bot
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Lấy các biến môi trường. Điều này rất quan trọng khi triển khai trên Render.
+# Đảm bảo bạn đã đặt các biến này trong cấu hình môi trường của Render.
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # URL công khai của dịch vụ Render của bạn
+PORT = int(os.getenv("PORT", "8000")) # Render sẽ cung cấp cổng này, mặc định là 8000
 
 # Ngôn ngữ được hỗ trợ cho các nút inline
 LANGUAGES = {
@@ -20,10 +32,10 @@ DetectorFactory.seed = 0
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Xử lý lệnh /start. Gửi tin nhắn chào mừng đến người dùng.
+    Xử lý lệnh /start. Gửi tin nhắn chào mừng và hướng dẫn sử dụng bot.
     """
     await update.message.reply_text(
-        "Chào bạn! Gửi một đoạn văn, mình sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật."
+        "Chào bạn! Mình là bot dịch tự động. Hãy gửi một đoạn văn bất kỳ, mình sẽ tự động phát hiện ngôn ngữ và cho bạn chọn dịch sang Tiếng Việt hoặc Tiếng Nhật. Thật tiện lợi phải không nào!"
     )
 
 async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -35,12 +47,13 @@ async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         detected_lang = detect(text)
+        logger.info(f"Detected language: {detected_lang} for text: {text[:50]}...")
     except Exception as e:
-        # Xử lý trường hợp không thể phát hiện ngôn ngữ (ví dụ: văn bản quá ngắn)
+        # Xử lý trường hợp không thể phát hiện ngôn ngữ (ví dụ: văn bản quá ngắn hoặc không rõ ràng)
         await update.message.reply_text(
-            "Xin lỗi, mình không thể phát hiện ngôn ngữ của đoạn văn này. Vui lòng thử lại với một đoạn văn dài hơn hoặc rõ ràng hơn."
+            "Xin lỗi, mình không thể phát hiện ngôn ngữ của đoạn văn này. Vui lòng thử lại với một đoạn văn dài hơn hoặc rõ ràng hơn nhé."
         )
-        print(f"Lỗi phát hiện ngôn ngữ: {e}")
+        logger.error(f"Error detecting language: {e} for text: {text}")
         return
 
     # Tạo bàn phím inline với các tùy chọn ngôn ngữ đích
@@ -53,7 +66,7 @@ async def translate_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"Phát hiện ngôn ngữ: **{detected_lang.upper()}**. Bạn muốn dịch sang ngôn ngữ nào?",
+        f"Mình phát hiện ngôn ngữ là: **{detected_lang.upper()}**. Bạn muốn dịch sang ngôn ngữ nào?",
         reply_markup=reply_markup,
         parse_mode="Markdown" # Sử dụng Markdown để in đậm ngôn ngữ phát hiện
     )
@@ -64,7 +77,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Thực hiện dịch văn bản và gửi kết quả.
     """
     query = update.callback_query
-    await query.answer() # Phải gọi query.answer() để bỏ trạng thái "đang tải" trên nút
+    await query.answer("Đang dịch...") # Phải gọi query.answer() để bỏ trạng thái "đang tải" trên nút và hiển thị thông báo ngắn
 
     data = query.data
     target_lang, original_text = data.split("|", 1) # Tách ngôn ngữ đích và văn bản gốc
@@ -74,11 +87,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Sử dụng GoogleTranslator với nguồn 'auto' để tự động phát hiện ngôn ngữ nguồn
         translator = GoogleTranslator(source='auto', target=target_lang)
         translated_text = translator.translate(original_text)
+        
         if not translated_text: # Xử lý trường hợp dịch trả về chuỗi rỗng
-            translated_text = "Không thể dịch đoạn văn này. Vui lòng thử lại."
+            translated_text = "Rất tiếc, mình không thể dịch đoạn văn này. Vui lòng thử lại sau nhé."
+            logger.warning(f"Translation returned empty for text: {original_text} to {target_lang}")
     except Exception as e:
-        translated_text = f"Đã xảy ra lỗi trong quá trình dịch: {str(e)}"
-        print(f"Lỗi dịch: {e}")
+        translated_text = f"Đã xảy ra lỗi trong quá trình dịch: {str(e)}. Vui lòng thử lại."
+        logger.error(f"Error during translation: {e} for text: {original_text} to {target_lang}")
 
     # Chỉnh sửa tin nhắn gốc để hiển thị bản dịch
     await query.edit_message_text(
@@ -89,7 +104,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """
     Hàm chính để khởi tạo và chạy bot.
+    Sử dụng webhook cho triển khai trên Render.
     """
+    if not TOKEN or not WEBHOOK_URL:
+        logger.error("TELEGRAM_BOT_TOKEN hoặc WEBHOOK_URL chưa được đặt trong biến môi trường.")
+        print("Lỗi: Vui lòng đặt TELEGRAM_BOT_TOKEN và WEBHOOK_URL trong các biến môi trường.")
+        return
+
     # Xây dựng ứng dụng bot với token của bạn
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -98,9 +119,20 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_text))
     app.add_handler(CallbackQueryHandler(button))
 
-    print("Bot Telegram đang chạy...")
-    # Bắt đầu polling để nhận các cập nhật từ Telegram
-    app.run_polling()
+    # Cấu hình webhook cho Render
+    # url_path thường là TOKEN hoặc một chuỗi ngẫu nhiên để bảo mật webhook endpoint
+    webhook_path = TOKEN
+    full_webhook_url = f"{WEBHOOK_URL}/{webhook_path}"
+
+    app.run_webhook(
+        listen="0.0.0.0", # Lắng nghe trên tất cả các giao diện mạng
+        port=PORT,
+        url_path=webhook_path,
+        webhook_url=full_webhook_url
+    )
+
+    logger.info(f"Bot Telegram đang chạy trên webhook: {full_webhook_url} tại cổng {PORT}")
+    print(f"Bot Telegram đang chạy trên webhook: {full_webhook_url} tại cổng {PORT}")
 
 if __name__ == "__main__":
     main()
