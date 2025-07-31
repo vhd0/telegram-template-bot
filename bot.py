@@ -45,7 +45,7 @@ EMOJI = {
     'info': 'ℹ️',
     'error': '❌',
     'success': '✅',
-    'help': '💡',
+    'help': '�',
     'cache': '💾',
     'time': '⏱️',
     'detect': '🔍' # Magnifying Glass Tilted Left
@@ -130,8 +130,8 @@ class TranslationService:
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
-        # Updated API endpoint for your Hugging Face Model Inference API
-        self.hf_api_url = "https://api-inference.huggingface.co/models/arsenaler14/hfapi"
+        # Changed API endpoint to directly call the NLLB model's Inference API
+        self.hf_api_url = "https://api-inference.huggingface.co/models/facebook/nllb-200-distilled-600M"
         self.lang_detect_service = LangDetectService() # Initialize LangDetectService
         self._initialized = False
 
@@ -728,4 +728,3 @@ if __name__ == "__main__":
         
     server = uvicorn.Server(config)
     server.run()
-
