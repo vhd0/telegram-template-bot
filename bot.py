@@ -45,7 +45,7 @@ EMOJI = {
     'info': 'ℹ️',
     'error': '❌',
     'success': '✅',
-    'help': '�',
+    'help': '💡',
     'cache': '💾',
     'time': '⏱️',
     'detect': '🔍' # Magnifying Glass Tilted Left
@@ -99,7 +99,6 @@ class TranslationCache:
             del self.cache[k]
         logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
 
-
 class LangDetectService:
     """Handles language detection using the langdetect library."""
     async def detect_language(self, text: str) -> Optional[str]:
@@ -125,28 +124,14 @@ class LangDetectService:
 
 
 class TranslationService:
-    """Manages translation using Hugging Face NLLB API and delegates language detection."""
+    """Manages translation using MyMemory API and delegates language detection."""
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
-        # Changed API endpoint to directly call the NLLB model's Inference API
-        self.hf_api_url = "https://api-inference.huggingface.co/models/facebook/nllb-200-distilled-600M"
+        self.mymemory_base_url = "https://api.mymemory.translated.net/get"
         self.lang_detect_service = LangDetectService() # Initialize LangDetectService
         self._initialized = False
-
-    def _map_lang_code_to_nllb(self, lang_code: str) -> Optional[str]:
-        """
-        Maps a short language code (e.g., 'vi', 'ja', 'en') to NLLB's specific codes.
-        """
-        mapping = {
-            "vi": "vie_Latn",
-            "ja": "jpn_Jpan",
-            "en": "eng_Latn",
-            # Add other mappings if your bot will support more languages
-            # Ensure these match the NLLB model's supported languages
-        }
-        return mapping.get(lang_code)
 
     def set_session(self, session: aiohttp.ClientSession):
         """Sets the aiohttp client session for the translation service."""
@@ -169,9 +154,9 @@ class TranslationService:
         translated = translated.replace("&gt;", ">")
         return translated.strip()
 
-    def maybe_cleanup_cache(self, force: bool = False):
-        """Triggers cache cleanup if enough time has passed or if forced."""
-        if force or datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
+    def maybe_cleanup_cache(self):
+        """Triggers cache cleanup if enough time has passed."""
+        if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
             self.cache.cleanup()
             self.last_cleanup = datetime.utcnow()
             logger.info("Scheduled cache cleanup executed.")
@@ -190,7 +175,7 @@ class TranslationService:
 
     async def translate(self, text: str, source_lang: str, target_lang: str) -> TranslationResult:
         """
-        Translates text using the Hugging Face NLLB API.
+        Translates text using the MyMemory API.
         Args:
             text (str): The text to translate.
             source_lang (str): The language code of the source text (e.g., 'vi', 'en').
@@ -198,31 +183,15 @@ class TranslationService:
         """
         self.maybe_cleanup_cache()
             
-        # Map source and target languages to NLLB specific codes
-        nllb_source_lang = self._map_lang_code_to_nllb(source_lang)
-        nllb_target_lang = self._map_lang_code_to_nllb(target_lang)
-
-        if not nllb_source_lang or not nllb_target_lang:
-            error_msg = f"Ngôn ngữ không được hỗ trợ bởi NLLB: Nguồn '{source_lang}' hoặc Đích '{target_lang}'."
-            logger.error(error_msg)
-            return TranslationResult(
-                original_text=text,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                success=False,
-                error_message=error_msg
-            )
-
-        # Cache key should use NLLB language codes for consistency
-        cache_key = f"{nllb_source_lang}-{nllb_target_lang}-{text}"
+        cache_key = f"{source_lang}-{target_lang}-{text}"
         cached = self.cache.get(cache_key)
         if cached:
             logger.info(f"Translation retrieved from cache for key: {cache_key[:50]}...")
             return TranslationResult(
                 original_text=text,
                 translated_text=cached,
-                source_lang=source_lang, # Keep original codes for bot display
-                target_lang=target_lang, # Keep original codes for bot display
+                source_lang=source_lang,
+                target_lang=target_lang,
                 success=True,
                 from_cache=True
             )
@@ -240,70 +209,52 @@ class TranslationService:
         processed_text = self.preprocess_text(text)
         result = TranslationResult(original_text=text, source_lang=source_lang, target_lang=target_lang)
             
-        # Get HF_TOKEN from environment variable
-        hf_token = os.getenv("HF_TOKEN")
-        headers = {}
-        if hf_token:
-            headers["Authorization"] = f"Bearer {hf_token}"
-        else:
-            logger.warning("HF_TOKEN environment variable not set. API calls might be rate-limited or fail.")
-            # Depending on your deployment, you might want to raise an error here
-            # if HF_TOKEN is strictly required for your model usage.
-
-        # Data payload for Hugging Face Inference API for translation models
-        data = {
-            "inputs": processed_text,
-            "parameters": {
-                "src_lang": nllb_source_lang,
-                "tgt_lang": nllb_target_lang
-            }
+        params = {
+            "q": processed_text,
+            "langpair": f"{source_lang}|{target_lang}",
+            "de": "a@b.c"
         }
-        
+
         for attempt in range(RETRY_COUNT):
             try:
-                async with self.session.post(
-                    self.hf_api_url,
-                    json=data, # Send data as JSON body
-                    headers=headers, # Add headers for authentication
-                    timeout=aiohttp.ClientTimeout(total=30) # Increased timeout for model inference
+                async with self.session.get(
+                    self.mymemory_base_url,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     response.raise_for_status()
-                    api_response = await response.json()
-                                
-                    # Expected response for NLLB Inference API is a list of dicts, e.g., [{"translation_text": "..."}]
-                    if not api_response or not isinstance(api_response, list) or not api_response[0].get("translation_text"):
-                        raise ValueError("Invalid response format from Hugging Face Inference API: 'translation_text' key missing or not a list of dicts.")
-                                
-                    translated_text = api_response[0]["translation_text"] # Get the translated text
+                    data = await response.json()
+                            
+                    if not data or "responseData" not in data:
+                        raise ValueError("Invalid response format from MyMemory API.")
+                            
+                    translated_text = data["responseData"].get("translatedText")
                     if not translated_text:
-                        raise ValueError("Empty translation received from Hugging Face Inference API.")
-                                
+                        raise ValueError("Empty translation received from MyMemory API.")
+                            
                     result.translated_text = self.postprocess_translation(translated_text)
                     result.success = True
-                                
+                            
                     self.cache.set(cache_key, result.translated_text)
-                                
+                            
                     logger.info(
-                        f"Translation successful (HF API call) {source_lang} -> {target_lang}: '{text[:30]}' -> "
-                        f"'{result.translated_text[:30]}'"
+                        f"Translation successful (API call) {source_lang} -> {target_lang}: {text[:30]} -> "
+                        f"{result.translated_text[:30]}"
                     )
-                                
+                            
                     return result
             except aiohttp.ClientError as e:
-                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}) with HF API: {e}", exc_info=True)
-                result.error_message = f"Lỗi kết nối dịch vụ dịch Hugging Face: {e}"
+                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = f"Lỗi kết nối dịch vụ: {e}"
             except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON response from HF API (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
-                result.error_message = "Lỗi phản hồi JSON từ dịch vụ dịch Hugging Face."
+                logger.error(f"Failed to decode JSON response (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
+                result.error_message = "Lỗi phản hồi từ dịch vụ dịch."
             except ValueError as e:
-                logger.error(f"Translation data error from HF API (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi dữ liệu dịch từ Hugging Face: {e}"
-            except IndexError:
-                logger.error(f"Unexpected response structure from HF API (attempt {attempt + 1}/{RETRY_COUNT}): 'data' list might be empty.", exc_info=True)
-                result.error_message = "Lỗi cấu trúc phản hồi từ Hugging Face API."
+                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = f"Lỗi dữ liệu dịch: {e}"
             except Exception as e:
-                logger.error(f"Unexpected error during translation with HF API (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = "Đã xảy ra lỗi không xác định khi dịch với Hugging Face API."
+                logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
+                result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
 
             if attempt < RETRY_COUNT - 1:
                 await asyncio.sleep(RETRY_DELAY)
@@ -557,16 +508,14 @@ async def lifespan(app: FastAPI):
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     webhook_url = os.getenv("WEBHOOK_URL")
-    hf_token = os.getenv("HF_TOKEN") # Retrieve HF_TOKEN
 
     # Log the values of environment variables for debugging
     logger.info(f"Environment variable TELEGRAM_BOT_TOKEN: {'***' + token[-4:] if token else 'None'}")
     logger.info(f"Environment variable WEBHOOK_URL: {webhook_url or 'None'}")
-    logger.info(f"Environment variable HF_TOKEN: {'***' + hf_token[-4:] if hf_token else 'None'}") # Log HF_TOKEN
 
-    if not token or not webhook_url or not hf_token: # Ensure HF_TOKEN is present
-        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN, WEBHOOK_URL, or HF_TOKEN. Exiting.")
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN, WEBHOOK_URL, or HF_TOKEN")
+    if not token or not webhook_url:
+        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Exiting.")
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
 
     global bot
     bot = TelegramBot()
