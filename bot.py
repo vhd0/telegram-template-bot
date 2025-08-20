@@ -35,7 +35,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "2.0.0" # Updated version for langdetect and flags
+VERSION = "2.1.0" # Updated version for optimization and feature removal
 
 # Emoji map for messages
 EMOJI = {
@@ -100,14 +100,15 @@ class TranslationCache:
         logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
 
 class LangDetectService:
-    """Handles language detection using the langdetect library."""
+    """Handles language detection using the langdetect library, non-blocking."""
     async def detect_language(self, text: str) -> Optional[str]:
         """
         Detects the language of the given text using langdetect.
-        Returns the detected language code (e.g., 'en', 'vi', 'ja') or None on failure.
+        Runs the blocking operation in a separate thread to avoid blocking the event loop.
+        Returns the detected language code (e.g., 'en', 'ja') or None on failure.
         """
         try:
-            detections = detect_langs(text)
+            detections = await asyncio.to_thread(detect_langs, text)
             if detections:
                 detected_lang = str(detections[0].lang)
                 logger.info(f"Detected language for '{text[:30]}...': {detected_lang} (confidence: {detections[0].prob})")
@@ -329,9 +330,9 @@ class TelegramBot:
         logger.info(f"User {user.id} started the bot")
             
         welcome_text = (
-            f"{EMOJI['hello']} こんにちは {user.first_name}さん！\n\n"
-            f"{EMOJI['info']} Bot dịch văn bản đa ngôn ngữ (Việt - Nhật)\n"
-            f"{EMOJI['translate']} Gửi tin nhắn để bot tự động nhận diện ngôn ngữ và chọn ngôn ngữ đầu ra qua nút bấm.\n"
+            f"{EMOJI['hello']} Xin chào {user.first_name}!\n\n"
+            f"{EMOJI['info']} Bot dịch văn bản tự động sang tiếng Nhật.\n"
+            f"{EMOJI['translate']} Gửi tin nhắn để bot tự động nhận diện ngôn ngữ và dịch sang tiếng Nhật.\n"
             f"{EMOJI['help']} Gõ /help để xem hướng dẫn"
         )
         await update.message.reply_text(welcome_text)
@@ -343,11 +344,11 @@ class TelegramBot:
         help_text = (
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
             "1. Gửi bất kỳ văn bản nào bạn muốn dịch.\n"
-            "2. Bot sẽ tự động nhận diện ngôn ngữ và hỏi bạn muốn dịch sang Tiếng Việt hay Tiếng Nhật.\n"
-            "3. Nhấn vào nút ngôn ngữ bạn muốn dịch.\n"
-            "4. Bản dịch sẽ được gửi.\n" # Simplified for brevity
-            "5. /start - Bắt đầu sử dụng\n"
-            "6. /help - Xem hướng dẫn\n\n"
+            "2. Bot sẽ tự động nhận diện ngôn ngữ và dịch sang tiếng Nhật.\n"
+            "3. Bản dịch sẽ được gửi lại cho bạn.\n\n"
+            "Các lệnh:\n"
+            "• /start - Bắt đầu sử dụng\n"
+            "• /help - Xem hướng dẫn\n\n"
             f"{EMOJI['help']} Mẹo:\n"
             "• Viết câu đầy đủ và rõ ràng\n"
             f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự"
@@ -357,8 +358,7 @@ class TelegramBot:
     async def process_text_and_ask_target_lang(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         Handles incoming text messages.
-        It detects the language and then prompts the user to select the target language
-        using inline keyboard buttons.
+        It detects the language and then performs the translation to Japanese.
         """
         user = update.effective_user
         text = update.message.text.strip()
@@ -388,88 +388,34 @@ class TelegramBot:
             )
             logger.warning(f"Failed to detect language for user {user.id} text: '{text[:50]}...'")
             return
-
-        # Store the original text and detected language in user_data
-        context.user_data[user.id] = {"original_text": text, "source_lang": detected_lang}
-        logger.info(f"Detected language '{detected_lang}' for user {user.id}. Stored text and lang in user_data.")
-
-        # Create inline keyboard for target language selection with flags and concise text
-        keyboard = [
-            [
-                InlineKeyboardButton("🇻🇳 Tiếng Việt", callback_data=f"translate_to:vi"),
-                InlineKeyboardButton("🇯🇵 Tiếng Nhật", callback_data=f"translate_to:ja")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Prompt for target language selection
-        await update.message.reply_text(
-            f"{EMOJI['translate']} Bạn muốn dịch sang ngôn ngữ nào?",
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
-
-    async def button_callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Handles inline keyboard button presses.
-        Retrieves the stored text and source language, then performs the translation.
-        """
-        query = update.callback_query
-        user = query.from_user
-        await query.answer() # Acknowledge the callback query immediately
-
-        chat_id = query.message.chat_id
         
-        # Retrieve stored user data
-        user_data = context.user_data.get(user.id)
-        if not user_data or "original_text" not in user_data or "source_lang" not in user_data:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{EMOJI['error']} Lỗi: Không tìm thấy văn bản gốc để dịch. Vui lòng gửi lại văn bản."
-            )
-            logger.warning(f"User {user.id} pressed callback button but no user_data found or complete.")
-            return
+        # We now directly translate to Japanese as per the user's request.
+        source_lang = detected_lang
+        target_lang = 'ja'
+        
+        logger.info(f"User {user.id} chose to translate from {source_lang} to {target_lang} for text: '{text[:50]}...'")
 
-        original_text = user_data["original_text"]
-        source_lang = user_data["source_lang"]
+        # Set typing status to indicate processing
+        await update.message.chat.send_action(action="typing")
         
         try:
-            target_lang = query.data.split(":")[1]
-        except IndexError:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"{EMOJI['error']} Lỗi: Dữ liệu nút bấm không hợp lệ. Vui lòng thử lại."
-            )
-            logger.error(f"Invalid callback_data received: {query.data}")
-            return
-        
-        logger.info(f"User {user.id} chose to translate from {source_lang} to {target_lang} for text: '{original_text[:50]}...'")
-
-        # Set typing status to indicate processing (still good for UX feedback)
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        
-        try:
-            result = await self.translator.translate(original_text, source_lang, target_lang)
+            result = await self.translator.translate(text, source_lang, target_lang)
                 
             if result.success and result.translated_text:
-                # ONLY send the translated text for easy copying/forwarding
-                await context.bot.send_message(
-                    chat_id=chat_id,
+                await update.message.reply_text(
                     text=result.translated_text
                 )
                 logger.info(f"Translation successful for user {user.id}")
             else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
+                await update.message.reply_text(
                     text=f"{EMOJI['error']} 申し訳ございません。\n"
                          f"{result.error_message or '翻訳エラーが発生しました。'}"
                 )
                 logger.error(f"Translation failed for user {user.id}: {result.error_message}")
                 
         except Exception as e:
-            logger.error(f"Error during translation from button callback for user {user.id}: {e}", exc_info=True)
-            await context.bot.send_message(
-                chat_id=chat_id,
+            logger.error(f"Error during translation for user {user.id}: {e}", exc_info=True)
+            await update.message.reply_text(
                 text=f"{EMOJI['error']} エラーが発生しました。\n"
                      "Đã xảy ra lỗi. Vui lòng thử lại sau."
             )
@@ -478,6 +424,17 @@ class TelegramBot:
             if user.id in context.user_data:
                 del context.user_data[user.id]
                 logger.debug(f"Cleaned up user_data for user {user.id}")
+
+    async def button_callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Acknowledge any button presses but do not process them further, as
+        the inline keyboard is now removed. This prevents errors if a user
+        presses an old button from before the update.
+        """
+        query = update.callback_query
+        await query.answer("Chức năng này không còn được hỗ trợ. Vui lòng gửi trực tiếp văn bản bạn muốn dịch.", show_alert=True)
+        logger.info(f"User {query.from_user.id} pressed a deprecated callback button.")
+
 
 bot: Optional['TelegramBot'] = None
 
@@ -502,7 +459,7 @@ async def lifespan(app: FastAPI):
     Handles bot initialization, aiohttp session creation, and webhook setup.
     """
     uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    health_filter = HealthCheckFilter() 
+    health_filter = HealthCheckFilter()  
     uvicorn_access_logger.addFilter(health_filter)
     logger.info("Uvicorn health check log filter added.")
 
