@@ -35,7 +35,7 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "2.1.0" # Updated version for optimization and feature removal
+VERSION = "2.2.0" # Updated version for async startup optimization
 
 # Emoji map for messages
 EMOJI = {
@@ -436,7 +436,10 @@ class TelegramBot:
         logger.info(f"User {query.from_user.id} pressed a deprecated callback button.")
 
 
+# Global variables
 bot: Optional['TelegramBot'] = None
+bot_init_task: Optional[asyncio.Task] = None
+is_bot_ready = False
 
 class HealthCheckFilter(logging.Filter):
     """
@@ -452,68 +455,78 @@ class HealthCheckFilter(logging.Filter):
                 pass
         return True
 
+async def initialize_bot_in_background():
+    """Initializes the bot and its services in a background task."""
+    global bot, is_bot_ready
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    webhook_url = os.getenv("WEBHOOK_URL")
+
+    if not token or not webhook_url:
+        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Bot will not start.")
+        return
+
+    try:
+        aiohttp_session = aiohttp.ClientSession()
+        bot = TelegramBot()
+        bot.translator.set_session(aiohttp_session)
+        logger.info("TranslationService aiohttp session created.")
+
+        success = await bot.initialize(token, webhook_url)
+        if success:
+            is_bot_ready = True
+            logger.info("Bot initialized successfully and is ready to receive updates.")
+        else:
+            logger.error("Failed to initialize bot. Bot will not be operational.")
+
+    except Exception as e:
+        logger.error(f"Startup task failed during bot initialization: {e}", exc_info=True)
+        if bot and bot.translator.session and not bot.translator.session.closed:
+            await bot.translator.session.close()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     FastAPI lifespan context manager for managing application startup and shutdown.
-    Handles bot initialization, aiohttp session creation, and webhook setup.
+    It now only starts the bot initialization as a background task.
     """
+    global bot_init_task, is_bot_ready
+    
     uvicorn_access_logger = logging.getLogger("uvicorn.access")
     health_filter = HealthCheckFilter()  
     uvicorn_access_logger.addFilter(health_filter)
     logger.info("Uvicorn health check log filter added.")
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    webhook_url = os.getenv("WEBHOOK_URL")
-
-    # Log the values of environment variables for debugging
-    logger.info(f"Environment variable TELEGRAM_BOT_TOKEN: {'***' + token[-4:] if token else 'None'}")
-    logger.info(f"Environment variable WEBHOOK_URL: {webhook_url or 'None'}")
-
-    if not token or not webhook_url:
-        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Exiting.")
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN or WEBHOOK_URL")
-
-    global bot
-    bot = TelegramBot()
-
-    aiohttp_session = None
-    try:
-        aiohttp_session = aiohttp.ClientSession()
-        bot.translator.set_session(aiohttp_session)
-        logger.info("TranslationService aiohttp session created.")
-
-        success = await bot.initialize(token, webhook_url)
-        if not success:
-            logger.critical("Failed to initialize bot. Application will not start.")
-            raise RuntimeError("Failed to initialize bot")
-        logger.info("Bot initialized successfully and ready to receive updates.")
-    except Exception as e:
-        logger.critical(f"Startup failed due to bot initialization or session creation error: {e}", exc_info=True)
-        if aiohttp_session and not aiohttp_session.closed:
-            await aiohttp_session.close()
-        raise
-        
+    logger.info("Application starting up. Scheduling bot initialization.")
+    bot_init_task = asyncio.create_task(initialize_bot_in_background())
+    
     yield
-
-    uvicorn_access_logger.removeFilter(health_filter)
-    logger.info("Uvicorn health check log filter removed.")
-
+    
     logger.info("Application shutdown initiated.")
+    uvicorn_access_logger.removeFilter(health_filter)
+    
+    if bot_init_task and not bot_init_task.done():
+        logger.info("Canceling background bot initialization task.")
+        bot_init_task.cancel()
+        try:
+            await bot_init_task
+        except asyncio.CancelledError:
+            logger.info("Background bot initialization task cancelled successfully.")
+
     try:
         if bot and bot.application:
             await bot.application.shutdown()
             logger.info("Telegram bot application shutdown complete.")
             
-        if aiohttp_session and not aiohttp_session.closed:
-            await aiohttp_session.close()
+        if bot and bot.translator.session and not bot.translator.session.closed:
+            await bot.translator.session.close()
             logger.info("Translation service aiohttp session closed.")
     except Exception as e:
         logger.error(f"Error during application shutdown: {e}", exc_info=True)
 
 app = FastAPI(
     title="Telegram Translation Bot",
-    description="Bot dịch văn bản đa ngôn ngữ (Việt - Nhật)",
+    description="Bot dịch văn bản tự động sang tiếng Nhật",
     version=VERSION,
     lifespan=lifespan
 )
@@ -521,10 +534,10 @@ app = FastAPI(
 @app.get("/")
 async def root():
     """Root endpoint with basic status."""
-    if bot is None or not bot._initialized:
+    if not is_bot_ready:
         return {
             "status": "initializing",
-            "message": "Bot is still initializing. Please wait.",
+            "message": "Bot is still initializing in the background. Please wait.",
             "version": VERSION,
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -545,7 +558,7 @@ async def health_check():
     """Enhanced health check endpoint for uptime monitoring."""
     current_time = datetime.utcnow()
     
-    if bot is None or not bot._initialized:
+    if not is_bot_ready:
         uptime = current_time - (bot._start_time if bot else current_time)
         logger.warning(f"Health check failed: Bot not initialized. Uptime: {uptime.total_seconds()}s")
         raise HTTPException(
@@ -592,7 +605,7 @@ async def health_check():
 @app.post("/{token}")
 async def telegram_webhook(token: str, request: Request):
     """Handles Telegram webhook requests."""
-    if bot is None or not bot._initialized:
+    if not is_bot_ready:
         logger.warning("Received webhook but bot is not initialized. Responding with 503.")
         raise HTTPException(status_code=503, detail="Bot is not initialized")
         
