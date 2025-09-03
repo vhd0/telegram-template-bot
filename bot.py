@@ -6,11 +6,11 @@ import aiohttp
 import urllib.parse
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -20,13 +20,20 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler
 )
-# Import for language detection library
 from langdetect import detect_langs, LangDetectException
 
-# Logging configuration
+# Logging configuration with optimized settings
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            'bot.log',
+            maxBytes=1024*1024,  # 1MB
+            backupCount=3
+        )
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -35,29 +42,23 @@ MAX_TEXT_LENGTH = 500
 RETRY_COUNT = 3
 RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
-VERSION = "2.2.0" # Updated version for async startup optimization
+VERSION = "2.3.0"  # Updated version with optimizations
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
-# Emoji map for messages
+# Emoji map for messages - moved to constant for better memory usage
 EMOJI = {
-    'hello': '👋',
-    'translate': '🔄',
-    'warning': '⚠️',
-    'info': 'ℹ️',
-    'error': '❌',
-    'success': '✅',
-    'help': '💡',
-    'cache': '💾',
-    'time': '⏱️',
-    'detect': '🔍' # Magnifying Glass Tilted Left
+    'hello': '👋', 'translate': '🔄', 'warning': '⚠️', 'info': 'ℹ️',
+    'error': '❌', 'success': '✅', 'help': '💡', 'cache': '💾',
+    'time': '⏱️', 'detect': '🔍'
 }
 
-@dataclass
+@dataclass(slots=True)  # Use slots for better memory efficiency
 class CacheEntry:
     """Represents an entry in the translation cache."""
     text: str
     timestamp: datetime
 
-@dataclass
+@dataclass(slots=True)
 class TranslationResult:
     """Stores the result of a translation operation."""
     original_text: str
@@ -67,127 +68,124 @@ class TranslationResult:
     success: bool = False
     error_message: Optional[str] = None
     from_cache: bool = False
-    detected_source_lang: Optional[str] = None # Stores the language detected for the input text
+    detected_source_lang: Optional[str] = None
 
 class TranslationCache:
-    """A simple in-memory cache for translation results."""
-    def __init__(self, timeout: int = CACHE_TIMEOUT):
+    """Optimized in-memory cache for translation results."""
+    def __init__(self, timeout: int = CACHE_TIMEOUT, max_size: int = 10000):
         self.cache: Dict[str, CacheEntry] = {}
         self.timeout = timeout
-        
+        self.max_size = max_size
+        self._last_cleanup = datetime.utcnow()
+        self._cleanup_interval = timedelta(minutes=30)
+
     def get(self, key: str) -> Optional[str]:
-        """Retrieves a value from the cache if it exists and is not expired."""
+        """Get cached translation with optimized expiry check."""
         if key in self.cache:
             entry = self.cache[key]
             if datetime.utcnow() - entry.timestamp < timedelta(seconds=self.timeout):
                 return entry.text
             del self.cache[key]
         return None
-        
-    def set(self, key: str, value: str):
-        """Adds or updates an entry in the cache with the current timestamp."""
+
+    def set(self, key: str, value: str) -> None:
+        """Set cache entry with size management."""
+        if len(self.cache) >= self.max_size:
+            # Remove oldest 10% of entries if cache is full
+            sorted_entries = sorted(
+                self.cache.items(),
+                key=lambda x: x[1].timestamp
+            )
+            for old_key, _ in sorted_entries[:len(sorted_entries) // 10]:
+                del self.cache[old_key]
         self.cache[key] = CacheEntry(text=value, timestamp=datetime.utcnow())
-        
-    def cleanup(self):
-        """Removes expired entries from the cache."""
+
+    def maybe_cleanup(self) -> None:
+        """Optimized cache cleanup with reduced frequency."""
         now = datetime.utcnow()
-        expired = [
-            k for k, v in self.cache.items()
-            if now - v.timestamp >= timedelta(seconds=self.timeout)
-        ]
-        for k in expired:
-            del self.cache[k]
-        logger.info(f"Cache cleanup completed. Remaining entries: {len(self.cache)}")
+        if now - self._last_cleanup >= self._cleanup_interval:
+            self._last_cleanup = now
+            expired = [
+                k for k, v in self.cache.items()
+                if now - v.timestamp >= timedelta(seconds=self.timeout)
+            ]
+            for k in expired:
+                del self.cache[k]
 
 class LangDetectService:
-    """Handles language detection using the langdetect library, non-blocking."""
+    """Optimized language detection service with caching."""
+    def __init__(self, cache_timeout: int = 3600):
+        self._cache: Dict[str, Tuple[str, datetime]] = {}
+        self._cache_timeout = timedelta(seconds=cache_timeout)
+
     async def detect_language(self, text: str) -> Optional[str]:
-        """
-        Detects the language of the given text using langdetect.
-        Runs the blocking operation in a separate thread to avoid blocking the event loop.
-        Returns the detected language code (e.g., 'en', 'ja') or None on failure.
-        """
+        """Detect language with caching and optimized processing."""
+        # Use first 100 chars for cache key to save memory
+        cache_key = hash(text[:100])
+        cached = self._cache.get(str(cache_key))
+        
+        if cached and (datetime.utcnow() - cached[1]) < self._cache_timeout:
+            return cached[0]
+
         try:
             detections = await asyncio.to_thread(detect_langs, text)
-            if detections:
-                detected_lang = str(detections[0].lang)
-                logger.info(f"Detected language for '{text[:30]}...': {detected_lang} (confidence: {detections[0].prob})")
-                return detected_lang
-            else:
-                logger.warning(f"Langdetect returned no detections for '{text[:30]}...'")
-                return None
-        except LangDetectException as e:
-            logger.warning(f"Could not detect language for text '{text[:30]}...' due to: {e}")
-            return None
+            if detections and detections[0].prob > 0.5:  # Add confidence threshold
+                lang = str(detections[0].lang)
+                self._cache[str(cache_key)] = (lang, datetime.utcnow())
+                return lang
+        except LangDetectException:
+            pass
         except Exception as e:
-            logger.error(f"Unexpected error during language detection with langdetect: {e}", exc_info=True)
-            return None
-
+            logger.error(f"Language detection error: {e}", exc_info=True)
+        return None
 
 class TranslationService:
-    """Manages translation using MyMemory API and delegates language detection."""
+    """Optimized translation service with improved error handling and caching."""
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache = TranslationCache()
         self.last_cleanup = datetime.utcnow()
         self.mymemory_base_url = "https://api.mymemory.translated.net/get"
-        self.lang_detect_service = LangDetectService() # Initialize LangDetectService
+        self.lang_detect_service = LangDetectService()
         self._initialized = False
+        self._rate_limit_reset = datetime.utcnow()
+        self._requests_remaining = 100  # Adjust based on API limits
 
-    def set_session(self, session: aiohttp.ClientSession):
-        """Sets the aiohttp client session for the translation service."""
+    def set_session(self, session: aiohttp.ClientSession) -> None:
+        """Configure translation service with optimized session settings."""
         self.session = session
         self._initialized = True
-        logger.info("aiohttp ClientSession set for TranslationService.")
-
-    def preprocess_text(self, text: str) -> str:
-        """Standardizes the text for translation."""
-        return text.strip()
-
-    def postprocess_translation(self, translated: str) -> str:
-        """Standardizes the translated text by handling common HTML entities."""
-        if not translated:
-            return translated
-        translated = translated.replace("&quot;", '"')
-        translated = translated.replace("&#39;", "'")
-        translated = translated.replace("&amp;", "&")
-        translated = translated.replace("&lt;", "<")
-        translated = translated.replace("&gt;", ">")
-        return translated.strip()
-
-    def maybe_cleanup_cache(self):
-        """Triggers cache cleanup if enough time has passed."""
-        if datetime.utcnow() - self.last_cleanup > timedelta(hours=1):
-            self.cache.cleanup()
-            self.last_cleanup = datetime.utcnow()
-            logger.info("Scheduled cache cleanup executed.")
+        logger.info("TranslationService initialized with optimized session")
 
     async def get_service_status(self) -> Dict[str, Any]:
-        """Gets the status of the translation service."""
+        """Get service status with minimal overhead."""
         return {
             "status": "active" if self._initialized and self.session and not self.session.closed else "inactive",
             "cache_size": len(self.cache.cache),
-            "last_cleanup": self.last_cleanup.isoformat()
+            "rate_limit_reset": self._rate_limit_reset.isoformat(),
+            "requests_remaining": self._requests_remaining
         }
 
-    async def detect_language(self, text: str) -> Optional[str]:
-        """Delegates language detection to LangDetectService."""
-        return await self.lang_detect_service.detect_language(text)
+    async def translate(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str
+    ) -> TranslationResult:
+        """Optimized translation method with improved error handling and rate limiting."""
+        self.cache.maybe_cleanup()
 
-    async def translate(self, text: str, source_lang: str, target_lang: str) -> TranslationResult:
-        """
-        Translates text using the MyMemory API.
-        Args:
-            text (str): The text to translate.
-            source_lang (str): The language code of the source text (e.g., 'vi', 'en').
-            target_lang (str): The language code of the desired target translation (e.g., 'ja', 'vi').
-        """
-        self.maybe_cleanup_cache()
-            
+        # Check rate limits
+        if self._requests_remaining <= 0 and datetime.utcnow() < self._rate_limit_reset:
+            return TranslationResult(
+                original_text=text,
+                error_message="Rate limit exceeded. Please try again later.",
+                success=False
+            )
+
         cache_key = f"{source_lang}-{target_lang}-{text}"
         cached = self.cache.get(cache_key)
         if cached:
-            logger.info(f"Translation retrieved from cache for key: {cache_key[:50]}...")
             return TranslationResult(
                 original_text=text,
                 translated_text=cached,
@@ -196,22 +194,22 @@ class TranslationService:
                 success=True,
                 from_cache=True
             )
-            
+
         if not self.session or self.session.closed:
-            logger.error("TranslationService session is not active. Cannot translate.")
             return TranslationResult(
                 original_text=text,
-                source_lang=source_lang,
-                target_lang=target_lang,
-                success=False,
-                error_message="Dịch vụ dịch chưa sẵn sàng."
+                error_message="Translation service unavailable",
+                success=False
             )
 
-        processed_text = self.preprocess_text(text)
-        result = TranslationResult(original_text=text, source_lang=source_lang, target_lang=target_lang)
-            
+        result = TranslationResult(
+            original_text=text,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+
         params = {
-            "q": processed_text,
+            "q": text.strip(),
             "langpair": f"{source_lang}|{target_lang}",
             "de": "a@b.c"
         }
@@ -223,427 +221,300 @@ class TranslationService:
                     params=params,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
-                    response.raise_for_status()
+                    self._requests_remaining = int(response.headers.get('X-RateLimit-Remaining', 100))
+                    reset_after = int(response.headers.get('X-RateLimit-Reset', 3600))
+                    self._rate_limit_reset = datetime.utcnow() + timedelta(seconds=reset_after)
+
                     data = await response.json()
-                            
-                    if not data or "responseData" not in data:
-                        raise ValueError("Invalid response format from MyMemory API.")
-                            
-                    translated_text = data["responseData"].get("translatedText")
-                    if not translated_text:
-                        raise ValueError("Empty translation received from MyMemory API.")
-                            
-                    result.translated_text = self.postprocess_translation(translated_text)
-                    result.success = True
-                            
-                    self.cache.set(cache_key, result.translated_text)
-                            
-                    logger.info(
-                        f"Translation successful (API call) {source_lang} -> {target_lang}: {text[:30]} -> "
-                        f"{result.translated_text[:30]}"
-                    )
-                            
-                    return result
+                    if "responseData" in data and data["responseData"].get("translatedText"):
+                        result.translated_text = data["responseData"]["translatedText"]
+                        result.success = True
+                        self.cache.set(cache_key, result.translated_text)
+                        return result
+
+                    raise ValueError(f"Invalid API response: {data}")
+
             except aiohttp.ClientError as e:
-                logger.error(f"HTTP Client Error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi kết nối dịch vụ: {e}"
-            except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON response (attempt {attempt + 1}/{RETRY_COUNT}).", exc_info=True)
-                result.error_message = "Lỗi phản hồi từ dịch vụ dịch."
-            except ValueError as e:
-                logger.error(f"Translation data error (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = f"Lỗi dữ liệu dịch: {e}"
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                result.error_message = f"Connection error: {str(e)}"
             except Exception as e:
-                logger.error(f"Unexpected error during translation (attempt {attempt + 1}/{RETRY_COUNT}): {e}", exc_info=True)
-                result.error_message = "Đã xảy ra lỗi không xác định khi dịch."
+                logger.error(f"Translation error: {e}", exc_info=True)
+                result.error_message = "Translation service error"
+                break
 
-            if attempt < RETRY_COUNT - 1:
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                logger.error(f"All {RETRY_COUNT} translation attempts failed for text: {text[:50]}...")
-
-        result.error_message = result.error_message or "Không thể dịch văn bản. Vui lòng thử lại sau."
         return result
 
-
 class TelegramBot:
-    """Manages the Telegram bot's interaction logic."""
+    """Optimized Telegram bot with improved message handling and memory usage."""
     def __init__(self):
         self.application: Optional[Application] = None
         self.translator = TranslationService()
         self._initialized = False
         self._start_time = datetime.utcnow()
         self._bot_username: Optional[str] = None
+        self._health_status = {"status": "initializing"}
+        self._last_status_update = datetime.utcnow()
+        self._status_update_interval = timedelta(minutes=1)
 
     async def initialize(self, token: str, webhook_url: str) -> bool:
-        """Initializes the Telegram bot application."""
+        """Initialize bot with optimized startup sequence."""
         try:
             self.application = (
                 ApplicationBuilder()
                 .token(token)
+                .concurrent_updates(True)
+                .connection_pool_size(100)
+                .connect_timeout(10.0)
+                .pool_timeout(10.0)
+                .read_timeout(10.0)
+                .write_timeout(10.0)
                 .build()
             )
-                
+
+            # Initialize bot info
             me = await self.application.bot.get_me()
             self._bot_username = me.username
-            logger.info(f"Bot info retrieved: @{self._bot_username}")
-                
+
+            # Setup handlers
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CommandHandler("help", self.help_command))
             self.application.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self.process_text_and_ask_target_lang)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    self.process_text_and_translate
+                )
             )
-            self.application.add_handler(
-                CallbackQueryHandler(self.button_callback_handler)
-            )
-                
+            self.application.add_handler(CallbackQueryHandler(self.button_callback_handler))
+
+            # Initialize webhook
             await self.application.initialize()
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
-            logger.info(f"Webhook set to {webhook_url}/{token}")
-                
+
             self._initialized = True
             return True
-                
+
         except Exception as e:
-            logger.error(f"Bot initialization failed: {str(e)}", exc_info=True)
+            logger.error(f"Bot initialization failed: {e}", exc_info=True)
             return False
 
     async def get_bot_status(self) -> Dict[str, Any]:
-        """Gets bot status information without repeatedly calling get_me."""
-        status = "inactive"
-        username = self._bot_username
-        initialized = self._initialized
-
-        if self.application and self.application.bot and initialized:
-            status = "active"
-        
-        return {
-            "status": status,
-            "username": username,
-            "initialized": initialized,
-            "start_time": self._start_time.isoformat()
-        }
+        """Get cached bot status with periodic updates."""
+        now = datetime.utcnow()
+        if now - self._last_status_update >= self._status_update_interval:
+            self._health_status.update({
+                "status": "active" if self._initialized else "inactive",
+                "username": self._bot_username,
+                "uptime": (now - self._start_time).total_seconds(),
+                "initialized": self._initialized
+            })
+            self._last_status_update = now
+        return self._health_status
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handles the /start command."""
+        """Handle /start command with optimized message."""
         user = update.effective_user
-        logger.info(f"User {user.id} started the bot")
-            
+        logger.info(f"User {user.id} started bot")
+        
         welcome_text = (
             f"{EMOJI['hello']} Xin chào {user.first_name}!\n\n"
             f"{EMOJI['info']} Bot dịch văn bản tự động sang tiếng Nhật.\n"
-            f"{EMOJI['translate']} Gửi tin nhắn để bot tự động nhận diện ngôn ngữ và dịch sang tiếng Nhật.\n"
+            f"{EMOJI['translate']} Gửi tin nhắn để dịch.\n"
             f"{EMOJI['help']} Gõ /help để xem hướng dẫn"
         )
         await update.message.reply_text(welcome_text)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handles the /help command."""
-        logger.info(f"User {update.effective_user.id} requested help")
-            
+        """Handle /help command with optimized message."""
         help_text = (
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
-            "1. Gửi bất kỳ văn bản nào bạn muốn dịch.\n"
-            "2. Bot sẽ tự động nhận diện ngôn ngữ và dịch sang tiếng Nhật.\n"
-            "3. Bản dịch sẽ được gửi lại cho bạn.\n\n"
-            "Các lệnh:\n"
-            "• /start - Bắt đầu sử dụng\n"
-            "• /help - Xem hướng dẫn\n\n"
-            f"{EMOJI['help']} Mẹo:\n"
-            "• Viết câu đầy đủ và rõ ràng\n"
-            f"• Độ dài tối đa {MAX_TEXT_LENGTH} ký tự"
+            "1. Gửi văn bản cần dịch\n"
+            "2. Bot sẽ tự động dịch sang tiếng Nhật\n\n"
+            "Lệnh:\n"
+            "• /start - Bắt đầu\n"
+            "• /help - Hướng dẫn\n\n"
+            f"{EMOJI['help']} Lưu ý: Tối đa {MAX_TEXT_LENGTH} ký tự"
         )
         await update.message.reply_text(help_text)
 
-    async def process_text_and_ask_target_lang(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Handles incoming text messages.
-        It detects the language and then performs the translation to Japanese.
-        """
+    async def process_text_and_translate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Process and translate text with optimized handling."""
         user = update.effective_user
         text = update.message.text.strip()
-            
+
         if not text:
-            await update.message.reply_text(
-                f"{EMOJI['warning']} Vui lòng nhập văn bản để dịch."
-            )
+            await update.message.reply_text(f"{EMOJI['warning']} Vui lòng nhập văn bản.")
             return
 
         if len(text) > MAX_TEXT_LENGTH:
             await update.message.reply_text(
-                f"{EMOJI['warning']} Văn bản quá dài. "
-                f"Vui lòng giữ dưới {MAX_TEXT_LENGTH} ký tự."
+                f"{EMOJI['warning']} Văn bản quá dài (>{MAX_TEXT_LENGTH} ký tự)."
             )
             return
 
-        logger.info(f"Processing text for language detection for user {user.id}: '{text[:50]}...'")
-        await update.message.chat.send_action("typing") # Show "typing..." status to the user
+        await update.message.chat.send_action("typing")
 
-        detected_lang = await self.translator.detect_language(text)
-
-        if not detected_lang:
-            await update.message.reply_text(
-                f"{EMOJI['error']} Không thể nhận diện ngôn ngữ của văn bản. "
-                "Vui lòng thử lại với văn bản rõ ràng hơn."
-            )
-            logger.warning(f"Failed to detect language for user {user.id} text: '{text[:50]}...'")
-            return
-        
-        # We now directly translate to Japanese as per the user's request.
-        source_lang = detected_lang
-        target_lang = 'ja'
-        
-        logger.info(f"User {user.id} chose to translate from {source_lang} to {target_lang} for text: '{text[:50]}...'")
-
-        # Set typing status to indicate processing
-        await update.message.chat.send_action(action="typing")
-        
         try:
-            result = await self.translator.translate(text, source_lang, target_lang)
-                
+            detected_lang = await self.translator.lang_detect_service.detect_language(text)
+            if not detected_lang:
+                await update.message.reply_text(
+                    f"{EMOJI['error']} Không nhận diện được ngôn ngữ."
+                )
+                return
+
+            result = await self.translator.translate(text, detected_lang, 'ja')
+
             if result.success and result.translated_text:
-                await update.message.reply_text(
-                    text=result.translated_text
-                )
-                logger.info(f"Translation successful for user {user.id}")
+                await update.message.reply_text(result.translated_text)
             else:
-                await update.message.reply_text(
-                    text=f"{EMOJI['error']} 申し訳ございません。\n"
-                         f"{result.error_message or '翻訳エラーが発生しました。'}"
-                )
-                logger.error(f"Translation failed for user {user.id}: {result.error_message}")
-                
+                error_msg = result.error_message or "Lỗi dịch thuật"
+                await update.message.reply_text(f"{EMOJI['error']} {error_msg}")
+
         except Exception as e:
-            logger.error(f"Error during translation for user {user.id}: {e}", exc_info=True)
-            await update.message.reply_text(
-                text=f"{EMOJI['error']} エラーが発生しました。\n"
-                     "Đã xảy ra lỗi. Vui lòng thử lại sau."
-            )
-        finally:
-            # Clean up user data after translation is attempted
-            if user.id in context.user_data:
-                del context.user_data[user.id]
-                logger.debug(f"Cleaned up user_data for user {user.id}")
+            logger.error(f"Translation error for user {user.id}: {e}", exc_info=True)
+            await update.message.reply_text(f"{EMOJI['error']} Đã xảy ra lỗi.")
 
     async def button_callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Acknowledge any button presses but do not process them further, as
-        the inline keyboard is now removed. This prevents errors if a user
-        presses an old button from before the update.
-        """
+        """Handle button callbacks."""
         query = update.callback_query
-        await query.answer("Chức năng này không còn được hỗ trợ. Vui lòng gửi trực tiếp văn bản bạn muốn dịch.", show_alert=True)
-        logger.info(f"User {query.from_user.id} pressed a deprecated callback button.")
+        await query.answer(
+            "Vui lòng gửi văn bản trực tiếp.",
+            show_alert=True
+        )
 
-
-# Global variables
-bot: Optional['TelegramBot'] = None
+# Global variables with type hints
+bot: Optional[TelegramBot] = None
 bot_init_task: Optional[asyncio.Task] = None
 is_bot_ready = False
 
-class HealthCheckFilter(logging.Filter):
-    """
-    A custom logging filter to prevent Uvicorn from logging INFO messages
-    for successful /health endpoint checks, keeping logs cleaner.
-    """
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name == "uvicorn.access" and record.levelno == logging.INFO:
-            try:
-                if record.args[1] == 'GET' and record.args[2] == '/health' and record.args[4] == 200:
-                    return False
-            except (IndexError, TypeError):
-                pass
-        return True
-
-async def initialize_bot_in_background():
-    """Initializes the bot and its services in a background task."""
-    global bot, is_bot_ready
-
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    webhook_url = os.getenv("WEBHOOK_URL")
-
-    if not token or not webhook_url:
-        logger.critical("Missing required environment variables: TELEGRAM_BOT_TOKEN or WEBHOOK_URL. Bot will not start.")
-        return
-
-    try:
-        aiohttp_session = aiohttp.ClientSession()
-        bot = TelegramBot()
-        bot.translator.set_session(aiohttp_session)
-        logger.info("TranslationService aiohttp session created.")
-
-        success = await bot.initialize(token, webhook_url)
-        if success:
-            is_bot_ready = True
-            logger.info("Bot initialized successfully and is ready to receive updates.")
-        else:
-            logger.error("Failed to initialize bot. Bot will not be operational.")
-
-    except Exception as e:
-        logger.error(f"Startup task failed during bot initialization: {e}", exc_info=True)
-        if bot and bot.translator.session and not bot.translator.session.closed:
-            await bot.translator.session.close()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    FastAPI lifespan context manager for managing application startup and shutdown.
-    It now only starts the bot initialization as a background task.
-    """
-    global bot_init_task, is_bot_ready
-    
-    uvicorn_access_logger = logging.getLogger("uvicorn.access")
-    health_filter = HealthCheckFilter()  
-    uvicorn_access_logger.addFilter(health_filter)
-    logger.info("Uvicorn health check log filter added.")
+    """Manage application lifespan with optimized startup/shutdown."""
+    global bot, bot_init_task, is_bot_ready
 
-    logger.info("Application starting up. Scheduling bot initialization.")
-    bot_init_task = asyncio.create_task(initialize_bot_in_background())
-    
-    yield
-    
-    logger.info("Application shutdown initiated.")
-    uvicorn_access_logger.removeFilter(health_filter)
-    
-    if bot_init_task and not bot_init_task.done():
-        logger.info("Canceling background bot initialization task.")
-        bot_init_task.cancel()
-        try:
-            await bot_init_task
-        except asyncio.CancelledError:
-            logger.info("Background bot initialization task cancelled successfully.")
+    # Initialize bot in background
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    webhook_url = os.environ.get("WEBHOOK_URL")
+
+    if not token or not webhook_url:
+        raise RuntimeError("Missing required environment variables")
 
     try:
-        if bot and bot.application:
-            await bot.application.shutdown()
-            logger.info("Telegram bot application shutdown complete.")
-            
-        if bot and bot.translator.session and not bot.translator.session.closed:
-            await bot.translator.session.close()
-            logger.info("Translation service aiohttp session closed.")
-    except Exception as e:
-        logger.error(f"Error during application shutdown: {e}", exc_info=True)
+        # Configure optimized aiohttp session
+        timeout = aiohttp.ClientTimeout(total=10, connect=3)
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            ttl_dns_cache=300,
+            use_dns_cache=True
+        )
+        session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+            raise_for_status=True
+        )
 
+        bot = TelegramBot()
+        bot.translator.set_session(session)
+
+        bot_init_task = asyncio.create_task(bot.initialize(token, webhook_url))
+        is_bot_ready = True
+
+        yield
+
+    finally:
+        # Cleanup
+        if bot_init_task and not bot_init_task.done():
+            bot_init_task.cancel()
+            try:
+                await bot_init_task
+            except asyncio.CancelledError:
+                pass
+
+        if bot:
+            if bot.application:
+                await bot.application.shutdown()
+            if bot.translator.session and not bot.translator.session.closed:
+                await bot.translator.session.close()
+
+# FastAPI application
 app = FastAPI(
     title="Telegram Translation Bot",
     description="Bot dịch văn bản tự động sang tiếng Nhật",
     version=VERSION,
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url=None if ENVIRONMENT == "production" else "/docs",
+    redoc_url=None if ENVIRONMENT == "production" else "/redoc"
 )
 
 @app.get("/")
 async def root():
-    """Root endpoint with basic status."""
-    if not is_bot_ready:
+    """Root endpoint with minimal status info."""
+    if not is_bot_ready or not bot:
         return {
             "status": "initializing",
-            "message": "Bot is still initializing in the background. Please wait.",
             "version": VERSION,
             "timestamp": datetime.utcnow().isoformat()
         }
-    
-    uptime = datetime.utcnow() - bot._start_time
-    cache_size = len(bot.translator.cache.cache)
+
     return {
         "status": "active",
-        "timestamp": datetime.utcnow().isoformat(),
         "version": VERSION,
-        "uptime_seconds": uptime.total_seconds(),
-        "cache_entries": cache_size,
-        "bot_username": bot._bot_username
+        "uptime": (datetime.utcnow() - bot._start_time).total_seconds()
     }
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check endpoint for uptime monitoring."""
-    current_time = datetime.utcnow()
-    
-    if not is_bot_ready:
-        uptime = current_time - (bot._start_time if bot else current_time)
-        logger.warning(f"Health check failed: Bot not initialized. Uptime: {uptime.total_seconds()}s")
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "status": "error",
-                "message": "Bot is not initialized",
-                "timestamp": current_time.isoformat(),
-                "uptime_seconds": uptime.total_seconds()
-            }
-        )
+    """Optimized health check endpoint."""
+    if not is_bot_ready or not bot:
+        raise HTTPException(status_code=503, detail="Bot initializing")
 
-    uptime = current_time - bot._start_time
-    bot_status = await bot.get_bot_status()
+    status = await bot.get_bot_status()
     translation_status = await bot.translator.get_service_status()
 
-    overall_status = "ok"
-    if bot_status["status"] != "active":
-        overall_status = "degraded"
-    if translation_status["status"] != "active":
-        overall_status = "degraded"
-
-    response = {
-        "status": overall_status,
-        "timestamp": current_time.isoformat(),
+    return {
+        "status": "ok" if status["status"] == "active" and
+                        translation_status["status"] == "active" else "degraded",
         "version": VERSION,
-        "uptime": {
-            "seconds": int(uptime.total_seconds()),
-            "formatted": str(uptime).split('.')[0]
-        },
         "services": {
-            "bot": bot_status,
+            "bot": status,
             "translation": translation_status
         }
     }
-    
-    if overall_status == "ok":
-        logger.debug(f"Health check: {response['status']}")
-    else:
-        logger.info(f"Health check: {response['status']}")
-        
-    return response
 
 @app.post("/{token}")
 async def telegram_webhook(token: str, request: Request):
-    """Handles Telegram webhook requests."""
-    if not is_bot_ready:
-        logger.warning("Received webhook but bot is not initialized. Responding with 503.")
-        raise HTTPException(status_code=503, detail="Bot is not initialized")
-        
-    expected_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not expected_token:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable is not set. Cannot validate webhook.")
-        raise HTTPException(status_code=500, detail="Server misconfiguration: Bot token not set.")
+    """Handle Telegram webhooks with improved error handling."""
+    if not is_bot_ready or not bot:
+        raise HTTPException(status_code=503, detail="Bot not ready")
 
-    if token != expected_token:
-        logger.warning(f"Invalid token received in webhook URL: {token[:10]}... (expected {expected_token[:10]}...)")
+    if token != os.environ.get("TELEGRAM_BOT_TOKEN"):
         raise HTTPException(status_code=403, detail="Invalid token")
-        
+
     try:
         update = Update.de_json(await request.json(), bot.application.bot)
         await bot.application.process_update(update)
         return {"status": "ok"}
     except json.JSONDecodeError:
-        logger.error("Received webhook with invalid JSON payload.")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error processing Telegram update: {error_msg}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing update: {error_msg}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal error")
 
 if __name__ == "__main__":
     import uvicorn
-        
-    port = int(os.getenv("PORT", "10000"))
-    log_level = os.getenv("LOG_LEVEL", "info")
-        
-    config = uvicorn.Config(
+
+    uvicorn_config = uvicorn.Config(
         "bot:app",
         host="0.0.0.0",
-        port=port,
-        workers=1,
+        port=int(os.environ.get("PORT", 10000)),
+        workers=2,
+        loop="uvloop",
+        http="httptools",
+        log_level="info",
         reload=False,
-        log_level=log_level
+        access_log=False,
+        proxy_headers=True,
+        forwarded_allow_ips="*"
     )
-        
-    server = uvicorn.Server(config)
+
+    server = uvicorn.Server(uvicorn_config)
     server.run()
