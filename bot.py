@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import json
 import aiohttp
@@ -22,18 +23,11 @@ from telegram.ext import (
 )
 from langdetect import detect_langs, LangDetectException
 
-# Logging configuration with optimized settings
+# Simple console logging for Render deployment
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(
-            'bot.log',
-            maxBytes=1024*1024,  # 1MB
-            backupCount=3
-        )
-    ]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -44,15 +38,17 @@ RETRY_DELAY = 1
 CACHE_TIMEOUT = 3600  # 1 hour
 VERSION = "2.3.0"  # Updated version with optimizations
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+DEPLOYMENT_TIME = "2025-09-03 02:45:09"  # Current deployment timestamp
+DEPLOYMENT_USER = "vhd0"  # Current deployment user
 
-# Emoji map for messages - moved to constant for better memory usage
+# Emoji map for messages
 EMOJI = {
     'hello': '👋', 'translate': '🔄', 'warning': '⚠️', 'info': 'ℹ️',
     'error': '❌', 'success': '✅', 'help': '💡', 'cache': '💾',
     'time': '⏱️', 'detect': '🔍'
 }
 
-@dataclass(slots=True)  # Use slots for better memory efficiency
+@dataclass(slots=True)
 class CacheEntry:
     """Represents an entry in the translation cache."""
     text: str
@@ -120,7 +116,6 @@ class LangDetectService:
 
     async def detect_language(self, text: str) -> Optional[str]:
         """Detect language with caching and optimized processing."""
-        # Use first 100 chars for cache key to save memory
         cache_key = hash(text[:100])
         cached = self._cache.get(str(cache_key))
         
@@ -129,7 +124,7 @@ class LangDetectService:
 
         try:
             detections = await asyncio.to_thread(detect_langs, text)
-            if detections and detections[0].prob > 0.5:  # Add confidence threshold
+            if detections and detections[0].prob > 0.5:
                 lang = str(detections[0].lang)
                 self._cache[str(cache_key)] = (lang, datetime.utcnow())
                 return lang
@@ -149,7 +144,7 @@ class TranslationService:
         self.lang_detect_service = LangDetectService()
         self._initialized = False
         self._rate_limit_reset = datetime.utcnow()
-        self._requests_remaining = 100  # Adjust based on API limits
+        self._requests_remaining = 100
 
     def set_session(self, session: aiohttp.ClientSession) -> None:
         """Configure translation service with optimized session settings."""
@@ -175,7 +170,6 @@ class TranslationService:
         """Optimized translation method with improved error handling and rate limiting."""
         self.cache.maybe_cleanup()
 
-        # Check rate limits
         if self._requests_remaining <= 0 and datetime.utcnow() < self._rate_limit_reset:
             return TranslationResult(
                 original_text=text,
@@ -245,7 +239,7 @@ class TranslationService:
         return result
 
 class TelegramBot:
-    """Optimized Telegram bot with improved message handling and memory usage."""
+    """Optimized Telegram bot with improved message handling."""
     def __init__(self):
         self.application: Optional[Application] = None
         self.translator = TranslationService()
@@ -271,11 +265,9 @@ class TelegramBot:
                 .build()
             )
 
-            # Initialize bot info
             me = await self.application.bot.get_me()
             self._bot_username = me.username
 
-            # Setup handlers
             self.application.add_handler(CommandHandler("start", self.start_command))
             self.application.add_handler(CommandHandler("help", self.help_command))
             self.application.add_handler(
@@ -286,11 +278,11 @@ class TelegramBot:
             )
             self.application.add_handler(CallbackQueryHandler(self.button_callback_handler))
 
-            # Initialize webhook
             await self.application.initialize()
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
 
             self._initialized = True
+            logger.info(f"Bot @{self._bot_username} initialized successfully")
             return True
 
         except Exception as e:
@@ -365,9 +357,11 @@ class TelegramBot:
 
             if result.success and result.translated_text:
                 await update.message.reply_text(result.translated_text)
+                logger.info(f"Translation successful for user {user.id}")
             else:
                 error_msg = result.error_message or "Lỗi dịch thuật"
                 await update.message.reply_text(f"{EMOJI['error']} {error_msg}")
+                logger.warning(f"Translation failed for user {user.id}: {error_msg}")
 
         except Exception as e:
             logger.error(f"Translation error for user {user.id}: {e}", exc_info=True)
@@ -381,7 +375,7 @@ class TelegramBot:
             show_alert=True
         )
 
-# Global variables with type hints
+# Global variables
 bot: Optional[TelegramBot] = None
 bot_init_task: Optional[asyncio.Task] = None
 is_bot_ready = False
@@ -391,7 +385,6 @@ async def lifespan(app: FastAPI):
     """Manage application lifespan with optimized startup/shutdown."""
     global bot, bot_init_task, is_bot_ready
 
-    # Initialize bot in background
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     webhook_url = os.environ.get("WEBHOOK_URL")
 
@@ -421,7 +414,6 @@ async def lifespan(app: FastAPI):
         yield
 
     finally:
-        # Cleanup
         if bot_init_task and not bot_init_task.done():
             bot_init_task.cancel()
             try:
@@ -447,17 +439,21 @@ app = FastAPI(
 
 @app.get("/")
 async def root():
-    """Root endpoint with minimal status info."""
+    """Root endpoint with deployment info."""
     if not is_bot_ready or not bot:
         return {
             "status": "initializing",
             "version": VERSION,
+            "deployment_time": DEPLOYMENT_TIME,
+            "deployment_user": DEPLOYMENT_USER,
             "timestamp": datetime.utcnow().isoformat()
         }
 
     return {
         "status": "active",
         "version": VERSION,
+        "deployment_time": DEPLOYMENT_TIME,
+        "deployment_user": DEPLOYMENT_USER,
         "uptime": (datetime.utcnow() - bot._start_time).total_seconds()
     }
 
