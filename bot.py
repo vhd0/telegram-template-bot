@@ -5,9 +5,10 @@ import json
 import aiohttp
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -32,15 +33,15 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
-MAX_TEXT_LENGTH = 5000          # DeepL hỗ trợ tốt văn bản dài
-RETRY_COUNT = 3
-RETRY_DELAY = 1                 # giây, nhân theo số lần retry
-CACHE_TIMEOUT = 3600            # 1 giờ
-VERSION = "3.0.0"
-ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+MAX_TEXT_LENGTH   = 5000
+RETRY_COUNT       = 3
+RETRY_DELAY       = 1       # giây
+CACHE_TIMEOUT     = 3600    # 1 giờ
+KEEPALIVE_INTERVAL = 14 * 60  # 14 phút — dưới ngưỡng spin-down 15 phút của Render
+BOT_INIT_TIMEOUT  = 30      # giây chờ tối đa khi webhook đến trong lúc khởi động
+VERSION           = "3.1.0"
+ENVIRONMENT       = os.environ.get("ENVIRONMENT", "development")
 
-# DeepL endpoint — dùng api-free cho Free plan, api cho Pro plan
-# Tự động chọn dựa theo API key suffix (:fx = Free)
 def _deepl_base_url(api_key: str) -> str:
     return (
         "https://api-free.deepl.com/v2"
@@ -51,7 +52,7 @@ def _deepl_base_url(api_key: str) -> str:
 EMOJI = {
     "hello": "👋", "translate": "🔄", "warning": "⚠️", "info": "ℹ️",
     "error": "❌", "success": "✅", "help": "💡", "cache": "💾",
-    "time": "⏱️", "detect": "🔍", "quota": "📊",
+    "time": "⏱️", "quota": "📊", "ping": "🏓",
 }
 
 # ─────────────────────────────────────────────
@@ -64,8 +65,6 @@ class CacheEntry:
 
 
 class TranslationCache:
-    """In-memory LRU-like cache với tự động dọn dẹp."""
-
     def __init__(self, timeout: int = CACHE_TIMEOUT, max_size: int = 10_000):
         self._cache: Dict[str, CacheEntry] = {}
         self.timeout = timeout
@@ -86,7 +85,6 @@ class TranslationCache:
 
     def set(self, key: str, value: str) -> None:
         if len(self._cache) >= self.max_size:
-            # Xóa 10% cũ nhất
             oldest = sorted(self._cache.items(), key=lambda x: x[1].timestamp)
             for k, _ in oldest[: len(oldest) // 10]:
                 del self._cache[k]
@@ -100,7 +98,7 @@ class TranslationCache:
             for k in expired:
                 del self._cache[k]
             if expired:
-                logger.debug(f"Cache cleanup: removed {len(expired)} expired entries")
+                logger.debug(f"Cache: dọn {len(expired)} bản dịch hết hạn")
 
     @property
     def size(self) -> int:
@@ -121,19 +119,9 @@ class TranslationResult:
 
 
 # ─────────────────────────────────────────────
-# DeepL Translation Service
+# DeepL Service
 # ─────────────────────────────────────────────
 class DeepLService:
-    """
-    Dịch thuật qua DeepL API v2.
-
-    Ưu điểm so với MyMemory:
-    - Không cần nhận diện ngôn ngữ riêng — DeepL tự phát hiện
-    - Chất lượng Anh↔Nhật vượt trội
-    - Trả về ngôn ngữ nguồn đã phát hiện trong response
-    - Quota rõ ràng qua /v2/usage
-    """
-
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = _deepl_base_url(api_key)
@@ -144,7 +132,7 @@ class DeepLService:
     def set_session(self, session: aiohttp.ClientSession) -> None:
         self.session = session
         self._initialized = True
-        logger.info(f"DeepLService initialized — endpoint: {self.base_url}")
+        logger.info(f"DeepLService khởi động — endpoint: {self.base_url}")
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -153,7 +141,6 @@ class DeepLService:
         }
 
     async def get_usage(self) -> Dict[str, Any]:
-        """Truy vấn quota còn lại từ DeepL."""
         if not self.session or self.session.closed:
             return {"error": "Session unavailable"}
         try:
@@ -163,7 +150,7 @@ class DeepLService:
                 timeout=aiohttp.ClientTimeout(total=8),
             ) as resp:
                 data = await resp.json()
-                used = data.get("character_count", 0)
+                used  = data.get("character_count", 0)
                 limit = data.get("character_limit", 0)
                 return {
                     "used": used,
@@ -172,13 +159,13 @@ class DeepLService:
                     "percent_used": round(used / limit * 100, 1) if limit else 0,
                 }
         except Exception as e:
-            logger.error(f"DeepL usage check failed: {e}")
+            logger.error(f"DeepL usage error: {e}")
             return {"error": str(e)}
 
     async def get_service_status(self) -> Dict[str, Any]:
-        status = "active" if self._initialized and self.session and not self.session.closed else "inactive"
+        ok = self._initialized and self.session and not self.session.closed
         return {
-            "status": status,
+            "status": "active" if ok else "inactive",
             "cache_size": self.cache.size,
             "endpoint": self.base_url,
         }
@@ -189,15 +176,8 @@ class DeepLService:
         target_lang: str = "JA",
         source_lang: Optional[str] = None,
     ) -> TranslationResult:
-        """
-        Dịch văn bản bằng DeepL.
-
-        - `source_lang`: để None để DeepL tự phát hiện (khuyến nghị)
-        - `target_lang`: mã ngôn ngữ DeepL (JA, EN, VI, …)
-        """
         self.cache.maybe_cleanup()
 
-        # Cache key — bao gồm source_lang nếu có
         cache_key = f"deepl:{source_lang or 'auto'}:{target_lang}:{text}"
         cached = self.cache.get(cache_key)
         if cached:
@@ -232,13 +212,12 @@ class DeepLService:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
-                    # Xử lý lỗi HTTP từ DeepL
                     if resp.status == 456:
-                        result.error_message = "Đã hết quota DeepL cho tháng này."
+                        result.error_message = "Đã hết quota DeepL tháng này."
                         return result
                     if resp.status == 429:
                         wait = RETRY_DELAY * (2 ** attempt)
-                        logger.warning(f"DeepL rate limit, retry sau {wait}s")
+                        logger.warning(f"DeepL rate limit, thử lại sau {wait}s")
                         await asyncio.sleep(wait)
                         continue
                     if resp.status >= 400:
@@ -248,15 +227,15 @@ class DeepLService:
 
                     data = await resp.json()
                     translation = data.get("translations", [{}])[0]
-                    translated = translation.get("text", "").strip()
+                    translated  = translation.get("text", "").strip()
 
                     if not translated:
                         result.error_message = "DeepL trả về kết quả rỗng."
                         return result
 
-                    result.translated_text = translated
-                    result.detected_source_lang = translation.get("detected_source_language")
-                    result.success = True
+                    result.translated_text        = translated
+                    result.detected_source_lang   = translation.get("detected_source_language")
+                    result.success                = True
                     self.cache.set(cache_key, translated)
                     return result
 
@@ -273,22 +252,75 @@ class DeepLService:
 
 
 # ─────────────────────────────────────────────
+# Keep-Alive Service
+# ─────────────────────────────────────────────
+class KeepAliveService:
+    """
+    Tự ping endpoint /ping mỗi 14 phút để ngăn Render
+    spin-down service sau 15 phút không hoạt động.
+    """
+
+    def __init__(self, ping_url: str, session: aiohttp.ClientSession):
+        self.ping_url = ping_url
+        self.session  = session
+        self._task: Optional[asyncio.Task] = None
+        self._ping_count  = 0
+        self._last_ping: Optional[datetime] = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="keepalive")
+        logger.info(f"KeepAlive bắt đầu — ping mỗi {KEEPALIVE_INTERVAL // 60} phút → {self.ping_url}")
+
+    async def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _loop(self) -> None:
+        # Chờ 60 giây sau khi khởi động để bot kịp init xong
+        await asyncio.sleep(60)
+        while True:
+            try:
+                async with self.session.get(
+                    self.ping_url,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    self._ping_count += 1
+                    self._last_ping   = datetime.utcnow()
+                    logger.info(f"KeepAlive ping #{self._ping_count}: HTTP {resp.status}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"KeepAlive ping thất bại: {e}")
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "ping_count": self._ping_count,
+            "last_ping":  self._last_ping.isoformat() if self._last_ping else None,
+            "interval_minutes": KEEPALIVE_INTERVAL // 60,
+        }
+
+
+# ─────────────────────────────────────────────
 # Telegram Bot
 # ─────────────────────────────────────────────
 class TelegramBot:
-    """Bot Telegram sử dụng DeepL để dịch Anh ↔ Nhật."""
-
     def __init__(self, deepl_api_key: str):
         self.application: Optional[Application] = None
-        self.translator = DeepLService(deepl_api_key)
+        self.translator  = DeepLService(deepl_api_key)
         self._initialized = False
-        self._start_time = datetime.utcnow()
+        self._start_time  = datetime.utcnow()
         self._bot_username: Optional[str] = None
         self._health_status: Dict[str, Any] = {"status": "initializing"}
         self._last_status_update = datetime.utcnow()
         self._status_update_interval = timedelta(minutes=1)
 
-    # ── Khởi tạo ─────────────────────────────
+    # ── Init ─────────────────────────────────
     async def initialize(self, token: str, webhook_url: str) -> bool:
         try:
             self.application = (
@@ -306,9 +338,8 @@ class TelegramBot:
             me = await self.application.bot.get_me()
             self._bot_username = me.username
 
-            # Đăng ký handlers
-            self.application.add_handler(CommandHandler("start", self.start_command))
-            self.application.add_handler(CommandHandler("help", self.help_command))
+            self.application.add_handler(CommandHandler("start",  self.start_command))
+            self.application.add_handler(CommandHandler("help",   self.help_command))
             self.application.add_handler(CommandHandler("status", self.status_command))
             self.application.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_translation)
@@ -319,7 +350,7 @@ class TelegramBot:
             await self.application.bot.set_webhook(url=f"{webhook_url}/{token}")
 
             self._initialized = True
-            logger.info(f"Bot @{self._bot_username} khởi động thành công")
+            logger.info(f"Bot @{self._bot_username} sẵn sàng ✅")
             return True
 
         except Exception as e:
@@ -331,10 +362,10 @@ class TelegramBot:
         now = datetime.utcnow()
         if now - self._last_status_update >= self._status_update_interval:
             self._health_status = {
-                "status": "active" if self._initialized else "inactive",
-                "username": self._bot_username,
-                "uptime_seconds": (now - self._start_time).total_seconds(),
-                "initialized": self._initialized,
+                "status":          "active" if self._initialized else "initializing",
+                "username":        self._bot_username,
+                "uptime_seconds":  (now - self._start_time).total_seconds(),
+                "initialized":     self._initialized,
             }
             self._last_status_update = now
         return self._health_status
@@ -354,40 +385,39 @@ class TelegramBot:
         await update.message.reply_text(
             f"{EMOJI['info']} Hướng dẫn sử dụng:\n\n"
             "• Gửi văn bản bằng bất kỳ ngôn ngữ nào\n"
-            "• Bot tự nhận diện ngôn ngữ và dịch sang tiếng Nhật 🇯🇵\n\n"
+            "• Bot tự nhận diện và dịch sang tiếng Nhật 🇯🇵\n\n"
             "Lệnh:\n"
             "  /start  — Bắt đầu\n"
-            "  /help   — Hướng dẫn này\n"
-            "  /status — Xem quota DeepL còn lại\n\n"
-            f"{EMOJI['warning']} Giới hạn: {MAX_TEXT_LENGTH:,} ký tự mỗi lần dịch."
+            "  /help   — Hướng dẫn\n"
+            "  /status — Quota DeepL & thông tin bot\n\n"
+            f"{EMOJI['warning']} Giới hạn: {MAX_TEXT_LENGTH:,} ký tự mỗi lần."
         )
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Hiển thị quota DeepL còn lại."""
         await update.message.chat.send_action("typing")
         usage = await self.translator.get_usage()
 
         if "error" in usage:
             await update.message.reply_text(
-                f"{EMOJI['error']} Không lấy được thông tin quota: {usage['error']}"
+                f"{EMOJI['error']} Không lấy được quota: {usage['error']}"
             )
             return
 
-        cache_size = self.translator.cache.size
         uptime = datetime.utcnow() - self._start_time
-        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
-        minutes = remainder // 60
+        h, rem  = divmod(int(uptime.total_seconds()), 3600)
+        m       = rem // 60
 
         await update.message.reply_text(
             f"{EMOJI['quota']} Trạng thái DeepL:\n\n"
-            f"• Đã dùng: {usage['used']:,} ký tự\n"
+            f"• Đã dùng : {usage['used']:,} ký tự\n"
             f"• Giới hạn: {usage['limit']:,} ký tự\n"
-            f"• Còn lại: {usage['remaining']:,} ký tự ({100 - usage['percent_used']:.1f}%)\n\n"
-            f"{EMOJI['cache']} Cache: {cache_size:,} bản dịch\n"
-            f"{EMOJI['time']} Uptime: {hours}h {minutes}m"
+            f"• Còn lại : {usage['remaining']:,} ký tự "
+            f"({100 - usage['percent_used']:.1f}%)\n\n"
+            f"{EMOJI['cache']} Cache   : {self.translator.cache.size:,} bản dịch\n"
+            f"{EMOJI['time']} Uptime  : {h}h {m}m"
         )
 
-    # ── Translation handler ───────────────────
+    # ── Translation ───────────────────────────
     async def handle_translation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         text = update.message.text.strip()
@@ -406,24 +436,22 @@ class TelegramBot:
         await update.message.chat.send_action("typing")
 
         try:
-            # DeepL tự phát hiện ngôn ngữ nguồn — không cần langdetect
             result = await self.translator.translate(text, target_lang="JA")
 
             if result.success and result.translated_text:
-                # Thêm badge nếu lấy từ cache
                 suffix = f" {EMOJI['cache']}" if result.from_cache else ""
                 await update.message.reply_text(result.translated_text + suffix)
                 logger.info(
                     f"User {user.id} | {result.detected_source_lang} → JA"
-                    f"{' (cache)' if result.from_cache else ''}"
+                    + (" (cache)" if result.from_cache else "")
                 )
             else:
-                error_msg = result.error_message or "Lỗi dịch thuật không xác định."
-                await update.message.reply_text(f"{EMOJI['error']} {error_msg}")
-                logger.warning(f"Dịch thất bại cho user {user.id}: {error_msg}")
+                msg = result.error_message or "Lỗi dịch thuật không xác định."
+                await update.message.reply_text(f"{EMOJI['error']} {msg}")
+                logger.warning(f"Dịch thất bại user {user.id}: {msg}")
 
         except Exception as e:
-            logger.error(f"Lỗi xử lý tin nhắn user {user.id}: {e}", exc_info=True)
+            logger.error(f"Lỗi xử lý user {user.id}: {e}", exc_info=True)
             await update.message.reply_text(f"{EMOJI['error']} Đã xảy ra lỗi, vui lòng thử lại.")
 
     async def button_callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -433,48 +461,63 @@ class TelegramBot:
 # ─────────────────────────────────────────────
 # FastAPI + Lifespan
 # ─────────────────────────────────────────────
-bot: Optional[TelegramBot] = None
+bot: Optional[TelegramBot]       = None
 bot_init_task: Optional[asyncio.Task] = None
+keepalive: Optional[KeepAliveService] = None
 is_bot_ready = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bot, bot_init_task, is_bot_ready
+    global bot, bot_init_task, keepalive, is_bot_ready
 
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    webhook_url = os.environ.get("WEBHOOK_URL")
-    deepl_api_key = os.environ.get("DEEPL_API_KEY")
+    token        = os.environ.get("TELEGRAM_BOT_TOKEN")
+    webhook_url  = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+    deepl_key    = os.environ.get("DEEPL_API_KEY")
 
     missing = [k for k, v in {
         "TELEGRAM_BOT_TOKEN": token,
-        "WEBHOOK_URL": webhook_url,
-        "DEEPL_API_KEY": deepl_api_key,
+        "WEBHOOK_URL":        webhook_url,
+        "DEEPL_API_KEY":      deepl_key,
     }.items() if not v]
-
     if missing:
         raise RuntimeError(f"Thiếu biến môi trường: {', '.join(missing)}")
 
+    # ── Tạo HTTP session ─────────────────────
+    connector = aiohttp.TCPConnector(
+        limit=100,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+    )
+    session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=15, connect=5),
+        connector=connector,
+    )
+
     try:
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-        )
-        session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15, connect=5),
-            connector=connector,
-        )
-
-        bot = TelegramBot(deepl_api_key=deepl_api_key)
+        # ── Khởi tạo bot (background, không block startup) ──
+        bot = TelegramBot(deepl_api_key=deepl_key)
         bot.translator.set_session(session)
-
-        bot_init_task = asyncio.create_task(bot.initialize(token, webhook_url))
+        bot_init_task = asyncio.create_task(
+            bot.initialize(token, webhook_url),
+            name="bot_init",
+        )
         is_bot_ready = True
+
+        # ── Khởi tạo keep-alive ──────────────
+        keepalive = KeepAliveService(
+            ping_url=f"{webhook_url}/ping",
+            session=session,
+        )
+        keepalive.start()
 
         yield
 
     finally:
+        # ── Dọn dẹp khi shutdown ─────────────
+        if keepalive:
+            await keepalive.stop()
+
         if bot_init_task and not bot_init_task.done():
             bot_init_task.cancel()
             try:
@@ -482,16 +525,15 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
 
-        if bot:
-            if bot.application:
-                await bot.application.shutdown()
-            if bot.translator.session and not bot.translator.session.closed:
-                await bot.translator.session.close()
+        if bot and bot.application:
+            await bot.application.shutdown()
+
+        if not session.closed:
+            await session.close()
 
 
 app = FastAPI(
-    title="Telegram Translation Bot (DeepL)",
-    description="Bot dịch văn bản sang tiếng Nhật bằng DeepL API",
+    title="Telegram Translation Bot",
     version=VERSION,
     lifespan=lifespan,
     docs_url=None if ENVIRONMENT == "production" else "/docs",
@@ -499,55 +541,86 @@ app = FastAPI(
 )
 
 
+# ─────────────────────────────────────────────
+# Endpoints
+# ─────────────────────────────────────────────
+
+@app.get("/ping")
+async def ping():
+    """
+    Endpoint siêu nhẹ — chỉ dùng để keep-alive.
+    Trả về ngay, không cần bot sẵn sàng.
+    """
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
+
+
 @app.get("/")
 async def root():
-    if not is_bot_ready or not bot:
+    if not bot:
         return {"status": "initializing", "version": VERSION}
+    uptime = (datetime.utcnow() - bot._start_time).total_seconds()
     return {
-        "status": "active",
-        "version": VERSION,
-        "uptime_seconds": (datetime.utcnow() - bot._start_time).total_seconds(),
+        "status":         "active" if bot._initialized else "starting",
+        "version":        VERSION,
+        "uptime_seconds": uptime,
+        "bot_ready":      bot._initialized,
     }
 
 
 @app.get("/health")
-async def health_check():
+async def health():
     if not is_bot_ready or not bot:
-        raise HTTPException(status_code=503, detail="Bot đang khởi tạo")
+        raise HTTPException(status_code=503, detail="Đang khởi tạo")
 
-    bot_status = await bot.get_bot_status()
-    translation_status = await bot.translator.get_service_status()
-
+    bot_status  = await bot.get_bot_status()
+    trans_status = await bot.translator.get_service_status()
     overall = (
-        "ok"
-        if bot_status["status"] == "active" and translation_status["status"] == "active"
+        "ok" if bot_status["status"] == "active"
+             and trans_status["status"] == "active"
         else "degraded"
     )
 
     return {
-        "status": overall,
-        "version": VERSION,
-        "services": {
-            "bot": bot_status,
-            "translation": translation_status,
-        },
+        "status":    overall,
+        "version":   VERSION,
+        "keepalive": keepalive.stats if keepalive else None,
+        "services":  {"bot": bot_status, "translation": trans_status},
     }
 
 
 @app.post("/{token}")
 async def telegram_webhook(token: str, request: Request):
-    if not is_bot_ready or not bot:
-        raise HTTPException(status_code=503, detail="Bot chưa sẵn sàng")
+    """
+    Xử lý webhook từ Telegram.
 
+    Nếu bot chưa init xong (cold start), chờ tối đa BOT_INIT_TIMEOUT giây
+    rồi mới xử lý — tránh Telegram retry quá sớm hoặc bỏ mất tin nhắn.
+    """
     if token != os.environ.get("TELEGRAM_BOT_TOKEN"):
         raise HTTPException(status_code=403, detail="Token không hợp lệ")
 
+    # Đọc body sớm, trước khi chờ
     try:
-        update = Update.de_json(await request.json(), bot.application.bot)
-        await bot.application.process_update(update)
-        return {"status": "ok"}
+        body = await request.json()
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="JSON không hợp lệ")
+
+    # Chờ bot init xong (xử lý cold start)
+    waited = 0
+    while not (bot and bot._initialized) and waited < BOT_INIT_TIMEOUT:
+        await asyncio.sleep(1)
+        waited += 1
+
+    if not (bot and bot._initialized):
+        # Vẫn chưa xong — trả 200 để Telegram không retry ngay,
+        # Telegram sẽ tự gửi lại sau ~1 phút
+        logger.warning(f"Webhook nhận lúc bot chưa sẵn sàng (đã chờ {waited}s)")
+        return JSONResponse({"status": "ok", "note": "bot_starting"})
+
+    try:
+        update = Update.de_json(body, bot.application.bot)
+        await bot.application.process_update(update)
+        return {"status": "ok"}
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error")
@@ -564,7 +637,7 @@ if __name__ == "__main__":
             "bot:app",
             host="0.0.0.0",
             port=int(os.environ.get("PORT", 10000)),
-            workers=2,
+            workers=1,          # 1 worker để giữ state in-memory nhất quán
             loop="uvloop",
             http="httptools",
             log_level="info",
